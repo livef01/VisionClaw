@@ -36,7 +36,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.meta.wearable.dat.camera.types.StreamSessionState
 import com.meta.wearable.dat.externalsampleapps.cameraaccess.R
-import com.meta.wearable.dat.externalsampleapps.cameraaccess.gemini.GeminiSessionViewModel
+import com.meta.wearable.dat.externalsampleapps.cameraaccess.gemini.LiteLLMSessionViewModel
 import com.meta.wearable.dat.externalsampleapps.cameraaccess.stream.StreamViewModel
 import com.meta.wearable.dat.externalsampleapps.cameraaccess.stream.StreamingMode
 import com.meta.wearable.dat.externalsampleapps.cameraaccess.wearables.WearablesViewModel
@@ -55,18 +55,18 @@ fun StreamScreen(
                     wearablesViewModel = wearablesViewModel,
                 ),
         ),
-    geminiViewModel: GeminiSessionViewModel = viewModel(),
+    liteLlmViewModel: LiteLLMSessionViewModel = viewModel(),
     webrtcViewModel: WebRTCSessionViewModel = viewModel(),
 ) {
     val streamUiState by streamViewModel.uiState.collectAsStateWithLifecycle()
-    val geminiUiState by geminiViewModel.uiState.collectAsStateWithLifecycle()
+    val liteLlmUiState by liteLlmViewModel.uiState.collectAsStateWithLifecycle()
     val webrtcUiState by webrtcViewModel.uiState.collectAsStateWithLifecycle()
     val lifecycleOwner = LocalLifecycleOwner.current
     val context = LocalContext.current
 
-    // Wire Gemini VM to Stream VM for frame forwarding
-    LaunchedEffect(geminiViewModel) {
-        streamViewModel.geminiViewModel = geminiViewModel
+    // Wire LiteLLM VM to Stream VM for frame forwarding
+    LaunchedEffect(liteLlmViewModel) {
+        streamViewModel.liteLlmViewModel = liteLlmViewModel
     }
 
     // Wire WebRTC VM to Stream VM for frame forwarding
@@ -77,10 +77,10 @@ fun StreamScreen(
     // Start stream or phone camera
     LaunchedEffect(isPhoneMode) {
         if (isPhoneMode) {
-            geminiViewModel.streamingMode = StreamingMode.PHONE
+            liteLlmViewModel.streamingMode = StreamingMode.PHONE
             streamViewModel.startPhoneCamera(lifecycleOwner)
         } else {
-            geminiViewModel.streamingMode = StreamingMode.GLASSES
+            liteLlmViewModel.streamingMode = StreamingMode.GLASSES
             streamViewModel.startStream()
         }
     }
@@ -88,8 +88,8 @@ fun StreamScreen(
     // Clean up on exit
     DisposableEffect(Unit) {
         onDispose {
-            if (geminiUiState.isGeminiActive) {
-                geminiViewModel.stopSession()
+            if (liteLlmUiState.isGeminiActive) {
+                liteLlmViewModel.stopSession()
             }
             if (webrtcUiState.isActive) {
                 webrtcViewModel.stopSession()
@@ -98,10 +98,10 @@ fun StreamScreen(
     }
 
     // Show errors as toasts
-    LaunchedEffect(geminiUiState.errorMessage) {
-        geminiUiState.errorMessage?.let { msg ->
+    LaunchedEffect(liteLlmUiState.errorMessage) {
+        liteLlmUiState.errorMessage?.let { msg ->
             Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
-            geminiViewModel.clearError()
+            liteLlmViewModel.clearError()
         }
     }
     LaunchedEffect(webrtcUiState.errorMessage) {
@@ -132,9 +132,9 @@ fun StreamScreen(
         Box(modifier = Modifier.fillMaxSize().padding(horizontal = 16.dp)) {
             // Top overlays (below status bar)
             Column(modifier = Modifier.align(Alignment.TopStart).statusBarsPadding().padding(top = 8.dp)) {
-                // Gemini overlay
-                if (geminiUiState.isGeminiActive) {
-                    GeminiOverlay(uiState = geminiUiState)
+                // LiteLLM overlay
+                if (liteLlmUiState.isGeminiActive) {
+                    LiteLlmOverlay(uiState = liteLlmUiState)
                 }
 
                 // WebRTC overlay
@@ -147,20 +147,21 @@ fun StreamScreen(
             // Controls at bottom
             ControlsRow(
                 onStopStream = {
-                    if (geminiUiState.isGeminiActive) geminiViewModel.stopSession()
+                    if (liteLlmUiState.isGeminiActive) liteLlmViewModel.stopSession()
                     if (webrtcUiState.isActive) webrtcViewModel.stopSession()
                     streamViewModel.stopStream()
                     wearablesViewModel.navigateToDeviceSelection()
                 },
                 onCapturePhoto = { streamViewModel.capturePhoto() },
                 onToggleAI = {
-                    if (geminiUiState.isGeminiActive) {
-                        geminiViewModel.stopSession()
+                    if (liteLlmUiState.isGeminiActive) {
+                        liteLlmViewModel.stopListening()
                     } else {
-                        geminiViewModel.startSession()
+                        liteLlmViewModel.startSession()
+                        liteLlmViewModel.startListening()
                     }
                 },
-                isAIActive = geminiUiState.isGeminiActive,
+                isAIActive = liteLlmUiState.isGeminiActive,
                 onToggleLive = {
                     if (webrtcUiState.isActive) {
                         webrtcViewModel.stopSession()

@@ -33,7 +33,7 @@ import com.meta.wearable.dat.camera.types.VideoFrame
 import com.meta.wearable.dat.camera.types.VideoQuality
 import com.meta.wearable.dat.core.Wearables
 import com.meta.wearable.dat.core.selectors.DeviceSelector
-import com.meta.wearable.dat.externalsampleapps.cameraaccess.gemini.GeminiSessionViewModel
+import com.meta.wearable.dat.externalsampleapps.cameraaccess.gemini.LiteLLMSessionViewModel
 import com.meta.wearable.dat.externalsampleapps.cameraaccess.phone.PhoneCameraManager
 import com.meta.wearable.dat.externalsampleapps.cameraaccess.wearables.WearablesViewModel
 import com.meta.wearable.dat.externalsampleapps.cameraaccess.webrtc.WebRTCSessionViewModel
@@ -69,7 +69,7 @@ class StreamViewModel(
   private var stateJob: Job? = null
 
   // VisionClaw additions
-  var geminiViewModel: GeminiSessionViewModel? = null
+  var liteLlmViewModel: LiteLLMSessionViewModel? = null
   var webrtcViewModel: WebRTCSessionViewModel? = null
   private var phoneCameraManager: PhoneCameraManager? = null
 
@@ -110,8 +110,8 @@ class StreamViewModel(
 
     manager.onFrameCaptured = { bitmap ->
       _uiState.update { it.copy(videoFrame = bitmap) }
-      // Forward to Gemini (throttled inside the VM)
-      geminiViewModel?.sendVideoFrameIfThrottled(bitmap)
+      // Forward to LiteLLM (throttled inside the VM)
+      liteLlmViewModel?.sendVideoFrameIfThrottled(bitmap)
       // Forward to WebRTC (every frame)
       webrtcViewModel?.pushVideoFrame(bitmap)
     }
@@ -237,8 +237,8 @@ class StreamViewModel(
     val bitmap = BitmapFactory.decodeByteArray(out, 0, out.size)
     _uiState.update { it.copy(videoFrame = bitmap) }
 
-    // Forward to Gemini (throttled inside the VM)
-    geminiViewModel?.sendVideoFrameIfThrottled(bitmap)
+    // Forward to LiteLLM (throttled inside the VM)
+    liteLlmViewModel?.sendVideoFrameIfThrottled(bitmap)
     // Forward to WebRTC (every frame)
     webrtcViewModel?.pushVideoFrame(bitmap)
   }
