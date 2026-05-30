@@ -1,374 +1,139 @@
 package com.meta.wearable.dat.externalsampleapps.cameraaccess.gemini
 
-import android.graphics.Bitmap
 import android.util.Base64
-import android.util.Log
-import com.meta.wearable.dat.externalsampleapps.cameraaccess.openclaw.GeminiFunctionCall
-import com.meta.wearable.dat.externalsampleapps.cameraaccess.openclaw.GeminiToolCall
-import com.meta.wearable.dat.externalsampleapps.cameraaccess.openclaw.GeminiToolCallCancellation
+import io.ktor.client.*
+import io.ktor.client.engine.cio.*
+import io.ktor.client.plugins.contentnegotiation.*
+import io.ktor.client.request.*
+import io.ktor.client.statement.*
+import io.ktor.http.*
+import io.ktor.serialization.kotlinx.json.*
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
-import org.json.JSONArray
-import org.json.JSONObject
-import java.io.ByteArrayOutputStream
-import java.util.concurrent.TimeUnit
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.Json
 
-/**
- * Local AI Audio Service — replaces GeminiLiveService.
- *
- * Pipeline:
- *   Mic chunk → [accumulate] → WhisperX STT → text
- *   text → LiteLLM /v1/chat/completions → text response
- *   text → Android TTS (via onResponseForTts callback)
- *
- * Also handles tool calls via OpenClaw bridge.
- */
-class LocalAudioService(
-    private val scope: CoroutineScope
-) {
-    companion object {
-        private const val TAG = "LocalAudioService"
-        private const val MAX_HISTORY = 10
+class LocalAudioService {
+
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val client = HttpClient(CIO) {
+        install(ContentNegotiation) { json(Json { ignoreUnknownKeys = true }) }
     }
 
-    // ─── Connection state (mirrors GeminiLiveService) ───────────────────────
-    sealed class ConnectionState {
-        data object Disconnected : ConnectionState()
-        data object Connecting : ConnectionState()
-        data object SettingUp : ConnectionState()
-        data object Ready : ConnectionState()
-        data class Error(val message: String) : ConnectionState()
+    sealed class PipelineEvent {
+        data class Transcript(val text: String) : PipelineEvent()
+        data class LlmResponse(val text: String) : PipelineEvent()
+        data class TtsReady(val pcmData: ByteArray) : PipelineEvent() {
+            override fun equals(other: Any?): Boolean =
+                other is TtsReady && other.pcmData.contentEquals(pcmData)
+            override fun hashCode(): Int = pcmData.contentHashCode()
+        }
+        data class Error(val message: String) : PipelineEvent()
     }
 
-    private val _connectionState = MutableStateFlow<ConnectionState>(ConnectionState.Disconnected)
-    val connectionState: StateFlow<ConnectionState> = _connectionState.asStateFlow()
+    private val _events = MutableStateFlow<PipelineEvent?>(null)
+    val events: StateFlow<PipelineEvent?> = _events
 
-    private val _isModelSpeaking = MutableStateFlow(false)
-    val isModelSpeaking: StateFlow<Boolean> = _isModelSpeaking.asStateFlow()
-
-    // ─── Callbacks (same interface as GeminiLiveService) ────────────────────
-    var onAudioReceived: ((ByteArray) -> Unit)? = null
-    var onTurnComplete: (() -> Unit)? = null
-    var onInterrupted: (() -> Unit)? = null
-    var onDisconnected: ((String?) -> Unit)? = null
-    var onInputTranscription: ((String) -> Unit)? = null
-    var onOutputTranscription: ((String) -> Unit)? = null
-    var onToolCall: ((GeminiToolCall) -> Unit)? = null
-    var onToolCallCancellation: ((GeminiToolCallCancellation) -> Unit)? = null
-
-    /** Called with LLM response text for TTS rendering */
+    /** Callback injected by LiteLLMSessionViewModel to route TTS audio to the TTS manager */
     var onResponseForTts: ((String) -> Unit)? = null
 
-    // ─── HTTP client for LiteLLM + WhisperX ──────────────────────────────────
-    private val client = OkHttpClient.Builder()
-        .connectTimeout(10, TimeUnit.SECONDS)
-        .readTimeout(60, TimeUnit.SECONDS)
-        .writeTimeout(30, TimeUnit.SECONDS)
-        .build()
-
-    // ─── Audio accumulation (Gemini-style: accumulate then flush) ───────────
-    private val audioBuffer = ByteArrayOutputStream()
-    private val bufferLock = Any()
-    private var lastUserSpeechEnd: Long = 0
-
-    // ─── Conversation history ───────────────────────────────────────────────
-    private val conversationHistory = mutableListOf<JSONObject>()
-    private var sessionKey: String = "agent:main:glass"
-
-    // ─── State observation job ─────────────────────────────────────────────
-    private var stateObservationJob: Job? = null
-
-    // ─── Latency tracking ───────────────────────────────────────────────────
-    private var responseLatencyLogged = false
-
-    // ─── Connect / Disconnect (mirrors GeminiLiveService lifecycle) ────────
-
-    fun connect(callback: (Boolean) -> Unit) {
-        _connectionState.value = ConnectionState.Connecting
-
-        scope.launch {
-            try {
-                // Verify LiteLLM is reachable
-                val healthCheck = withContext(Dispatchers.IO) {
-                    val request = Request.Builder()
-                        .url("${LocalAudioConfig.LITELLM_BASE_URL}/health")
-                        .get()
-                        .build()
-                    client.newCall(request).execute().use { it.code }
-                }
-
-                if (healthCheck != null && healthCheck in 200..499) {
-                    Log.d(TAG, "LiteLLM health check: HTTP $healthCheck")
-                }
-
-                _connectionState.value = ConnectionState.SettingUp
-
-                // Initialize conversation with system prompt
-                conversationHistory.clear()
-                conversationHistory.add(JSONObject().apply {
-                    put("role", "system")
-                    put("content", LocalAudioConfig.systemInstruction)
-                })
-
-                _connectionState.value = ConnectionState.Ready
-                callback(true)
-
-                // Start state observation
-                startStateObservation()
-
-            } catch (e: Exception) {
-                Log.e(TAG, "Connection failed: ${e.message}")
-                _connectionState.value = ConnectionState.Error(e.message ?: "Unknown error")
-                callback(false)
-            }
-        }
-    }
-
-    fun disconnect() {
-        stateObservationJob?.cancel()
-        stateObservationJob = null
-        _connectionState.value = ConnectionState.Disconnected
-        _isModelSpeaking.value = false
-        conversationHistory.clear()
-        audioBuffer.reset()
-        onToolCall = null
-        onToolCallCancellation = null
-        Log.d(TAG, "LocalAudioService disconnected")
-    }
-
-    // ─── Audio → STT pipeline ────────────────────────────────────────────────
-
-    /**
-     * Called by AudioManager when enough PCM bytes are accumulated.
-     * Sends to WhisperX → transcribes → sends to LLM.
-     */
-    fun sendAudio(data: ByteArray) {
-        if (_connectionState.value != ConnectionState.Ready) return
-
-        synchronized(bufferLock) {
-            audioBuffer.write(data)
-        }
-
-        // Process accumulated audio when buffer is large enough
-        val chunk = synchronized(bufferLock) {
-            if (audioBuffer.size() >= LocalAudioConfig.MIN_AUDIO_CHUNK_BYTES) {
-                val bytes = audioBuffer.toByteArray()
-                audioBuffer.reset()
-                bytes
-            } else null
-        }
-
-        if (chunk != null) {
-            scope.launch {
-                processAudioChunk(chunk)
-            }
-        }
-    }
-
-    private suspend fun processAudioChunk(chunk: ByteArray) {
-        // Step 1: STT via WhisperX
-        val transcript = withContext(Dispatchers.IO) {
-            transcribeWithWhisperX(chunk)
-        }
-
-        if (transcript.isBlank()) {
-            Log.d(TAG, "Empty transcription, skipping")
-            return
-        }
-
-        lastUserSpeechEnd = System.currentTimeMillis()
-        onInputTranscription?.invoke(transcript)
-
-        // Add user turn to history
-        conversationHistory.add(JSONObject().apply {
-            put("role", "user")
-            put("content", transcript)
-        })
-
-        // Trim history to MAX_HISTORY * 2
-        if (conversationHistory.size > MAX_HISTORY * 2) {
-            conversationHistory.subList(0, conversationHistory.size - MAX_HISTORY * 2).clear()
-        }
-
-        // Step 2: LLM via LiteLLM
-        _isModelSpeaking.value = true
-        val response = withContext(Dispatchers.IO) {
-            chatWithLiteLLM()
-        }
-        _isModelSpeaking.value = false
-
-        if (response.isBlank()) {
-            Log.d(TAG, "Empty LLM response")
-            onTurnComplete?.invoke()
-            return
-        }
-
-        onOutputTranscription?.invoke(response)
-
-        // Step 3: TTS — notify listener so ViewModel speaks via Android TTS
-        onResponseForTts?.invoke(response)
-        onTurnComplete?.invoke()
-    }
-
-    private suspend fun transcribeWithWhisperX(audioData: ByteArray): String {
+    // --- Step 1: PCM16 → WhisperX STT ---
+    suspend fun transcribe(pcmData: ByteArray): String? {
         return try {
-            val request = Request.Builder()
-                .url(LocalAudioConfig.whisperTranscribeUrl)
-                .post(audioData.toRequestBody("audio/pcm;rate=16000".toMediaType()))
-                .header("Content-Type", "audio/pcm;rate=16000")
-                .build()
+            val base64Audio = Base64.encodeToString(pcmData, Base64.NO_WRAP)
+            val body = mapOf(
+                "audio" to mapOf(
+                    "data" to base64Audio,
+                    "format" to "s16le",
+                    "sample_rate" to 16000,
+                    "channels" to 1
+                ),
+                "model" to "base",
+                "language" to "en"
+            )
 
-            client.newCall(request).execute().use { response ->
-                if (!response.isSuccessful) {
-                    Log.e(TAG, "WhisperX failed: ${response.code} ${response.message}")
-                    return ""
-                }
-                response.body?.string()?.trim() ?: ""
+            val response: HttpResponse = client.post(LocalAudioConfig.WHISPERX_URL) {
+                contentType(ContentType.Application.Json)
+                setBody(Json.encodeToString(mapOf("audio" to base64Audio)))
             }
+
+            val text = Json.decodeFromString<Map<String, String>>(
+                response.bodyAsText()
+            )["text"] ?: ""
+
+            _events.value = PipelineEvent.Transcript(text)
+            text
         } catch (e: Exception) {
-            Log.e(TAG, "WhisperX error: ${e.message}")
-            ""
+            _events.value = PipelineEvent.Error("WhisperX error: ${e.message}")
+            null
         }
     }
 
-    private suspend fun chatWithLiteLLM(): String {
-        // Build messages array for LiteLLM
-        val messages = JSONArray()
-        for (msg in conversationHistory) {
-            messages.put(msg)
-        }
-
-        val body = JSONObject().apply {
-            put("model", LocalAudioConfig.MODEL)
-            put("messages", messages)
-            put("max_tokens", 256)
-            put("temperature", 0.7)
-        }
-
-        val request = Request.Builder()
-            .url(LocalAudioConfig.litellmChatUrl)
-            .post(body.toString().toRequestBody("application/json".toMediaType()))
-            .header("Content-Type", "application/json")
-            .build()
-
-        return client.newCall(request).execute().use { response ->
-            if (!response.isSuccessful) {
-                Log.e(TAG, "LiteLLM failed: ${response.code}")
-                return ""
+    // --- Step 2: Transcript → LiteLLM ---
+    suspend fun generateResponse(transcript: String, visionFrames: List<String> = emptyList()): String? {
+        return try {
+            val messages = buildList {
+                add(mapOf("role" to "system", "content" to SYSTEM_PROMPT))
+                add(mapOf(
+                    "role" to "user",
+                    "content" to buildList {
+                        add(mapOf("type" to "text", "text" to transcript))
+                        visionFrames.forEach { frame ->
+                            add(mapOf("type" to "image_url", "image_url" to mapOf("url" to "data:image/jpeg;base64,$frame")))
+                        }
+                    }
+                ))
             }
-            val json = JSONObject(response.body?.string() ?: "")
-            val content = json.optJSONArray("choices")
-                ?.optJSONObject(0)
-                ?.optJSONObject("message")
-                ?.optString("content", "")
-                ?: ""
-            // Add assistant turn to history
-            conversationHistory.add(JSONObject().apply {
-                put("role", "assistant")
-                put("content", content)
-            })
+
+            val response: HttpResponse = client.post("${LocalAudioConfig.LITELLM_BASE_URL}/chat/completions") {
+                bearerAuth(System.getenv("LITELLM_KEY") ?: "local")
+                contentType(ContentType.Application.Json)
+                setBody(Json.encodeToString(mapOf(
+                    "model" to "local",
+                    "messages" to messages,
+                    "max_tokens" to 512
+                )))
+            }
+
+            val body = Json.decodeFromString<Map<String, Any>>(response.bodyAsText())
+            val content = (body["choices"] as? List<*>)?.get(0)
+                ?.let { (it as? Map<String, Any>)?.get("message") }
+                ?.let { (it as? Map<String, Any>)?.get("content") } as? String
+
+            _events.value = PipelineEvent.LlmResponse(content ?: "")
             content
+        } catch (e: Exception) {
+            _events.value = PipelineEvent.Error("LiteLLM error: ${e.message}")
+            null
         }
     }
 
-    // ─── Video frame → Vision ───────────────────────────────────────────────
+    // --- Step 3: Route LLM text → TTS callback ---
+    fun sendToTts(text: String) {
+        onResponseForTts?.invoke(text)
+    }
 
-    fun sendVideoFrame(bitmap: Bitmap) {
-        if (_connectionState.value != ConnectionState.Ready) return
-
+    // --- Full pipeline ---
+    fun runPipeline(pcmData: ByteArray, visionFrames: List<String> = emptyList()) {
         scope.launch {
-            withContext(Dispatchers.IO) {
-                sendVisionFrame(bitmap)
-            }
+            val transcript = transcribe(pcmData) ?: return@launch
+            val response = generateResponse(transcript, visionFrames) ?: return@launch
+            sendToTts(response)
         }
     }
 
-    private suspend fun sendVisionFrame(bitmap: Bitmap) {
-        try {
-            val baos = ByteArrayOutputStream()
-            bitmap.compress(Bitmap.CompressFormat.JPEG, LocalAudioConfig.VIDEO_JPEG_QUALITY, baos)
-            val base64 = Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP)
-
-            // Append vision message to last user message
-            val lastUserIdx = conversationHistory.indexOfLast { it.optString("role") == "user" }
-            if (lastUserIdx >= 0) {
-                val lastUser = conversationHistory[lastUserIdx]
-                // Add image to content array (LiteLLM-compatible vision format)
-                val currentContent = lastUser.optString("content", "")
-                lastUser.put("content", JSONArray().apply {
-                    put(JSONObject().apply {
-                        put("type", "text")
-                        put("text", currentContent)
-                    })
-                    put(JSONObject().apply {
-                        put("type", "image_url")
-                        put("image_url", JSONObject().apply {
-                            put("url", "data:image/jpeg;base64,$base64")
-                        })
-                    })
-                })
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Vision frame error: ${e.message}")
-        }
+    fun close() {
+        client.close()
     }
 
-    // ─── Tool calls (OpenClaw bridge) ────────────────────────────────────────
-
-    /**
-     * Called by LiteLLMSessionViewModel after a tool response comes back.
-     * Routes back into LLM context.
-     */
-    fun sendToolResponse(response: JSONObject) {
-        try {
-            val functionResponses = response.optJSONObject("toolResponse")
-                ?.optJSONArray("functionResponses")
-            if (functionResponses != null) {
-                for (i in 0 until functionResponses.length()) {
-                    val fr = functionResponses.getJSONObject(i)
-                    val result = fr.optString("result", "")
-                    conversationHistory.add(JSONObject().apply {
-                        put("role", "system")
-                        put("content", "[TOOL RESULT] $result")
-                    })
-                }
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Error processing tool response: ${e.message}")
-        }
-    }
-
-    fun sendTextMessage(text: String) {
-        if (_connectionState.value != ConnectionState.Ready) return
-        conversationHistory.add(JSONObject().apply {
-            put("role", "user")
-            put("content", text)
-        })
-    }
-
-    // ─── State observation ───────────────────────────────────────────────────
-
-    private fun startStateObservation() {
-        stateObservationJob = scope.launch {
-            while (isActive) {
-                delay(100)
-                // State propagation happens via flows directly
-            }
-        }
+    companion object {
+        private const val SYSTEM_PROMPT = """
+            You are a helpful voice assistant. Keep responses concise and conversational.
+            The user is speaking to you via voice. Respond in a natural, brief way.
+        """.trimIndent()
     }
 }
-
-/** Re-exports for compatibility with ToolCallRouter */
-typealias ToolCallStatus = com.meta.wearable.dat.externalsampleapps.cameraaccess.openclaw.ToolCallStatus
