@@ -222,7 +222,7 @@ class LocalAudioService {
     }
 
     companion object {
-        private const val SYSTEM_PROMPT = """
+        private val SYSTEM_PROMPT = """
             You are a helpful voice assistant wearing smart glasses. Keep responses concise and conversational.
             The user is speaking to you via voice. Respond in a natural, brief way.
             You have access to tools for controlling smart home devices, querying information, and more.
