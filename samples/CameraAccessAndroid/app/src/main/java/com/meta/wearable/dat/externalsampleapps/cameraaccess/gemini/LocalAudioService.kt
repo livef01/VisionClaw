@@ -62,7 +62,7 @@ class LocalAudioService {
             val base64Audio = Base64.encodeToString(pcmData, Base64.NO_WRAP)
             val response: HttpResponse = client.post(LocalAudioConfig.WHISPERX_URL) {
                 contentType(ContentType.Application.Json)
-                setBody(Json.encodeToString(mapOf("audio" to base64Audio)))
+                setBody(Json.encodeToString(mapOf("audio_base64" to base64Audio)))
             }
 
             val body = Json.decodeFromString<Map<String, Any>>(response.bodyAsText())
