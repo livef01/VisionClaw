@@ -16,6 +16,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
+import org.json.JSONObject
 
 class LocalAudioService {
 
@@ -62,7 +63,7 @@ class LocalAudioService {
             val base64Audio = Base64.encodeToString(pcmData, Base64.NO_WRAP)
             val response: HttpResponse = client.post(LocalAudioConfig.WHISPERX_URL) {
                 contentType(ContentType.Application.Json)
-                setBody(Json.encodeToString(mapOf("audio_base64" to base64Audio)))
+                setBody(JSONObject(mapOf("audio_base64" to base64Audio)).toString())
             }
 
             val body = Json.decodeFromString<Map<String, Any>>(response.bodyAsText())
@@ -99,11 +100,11 @@ class LocalAudioService {
             val response: HttpResponse = client.post("${LocalAudioConfig.LITELLM_BASE_URL}/chat/completions") {
                 bearerAuth(System.getenv("LITELLM_KEY") ?: "local")
                 contentType(ContentType.Application.Json)
-                setBody(Json.encodeToString(mapOf(
+                setBody(JSONObject(mapOf(
                     "model" to "local",
                     "messages" to messages,
                     "max_tokens" to 512
-                )))
+                )).toString())
             }
 
             val body = Json.decodeFromString<Map<String, Any>>(response.bodyAsText())
@@ -164,16 +165,14 @@ class LocalAudioService {
                 }
 
                 // Continue conversation with tool result
-                val body = mapOf(
-                    "model" to "local",
-                    "messages" to messages,
-                    "max_tokens" to 512
-                )
-
                 val httpResponse: HttpResponse = client.post("${LocalAudioConfig.LITELLM_BASE_URL}/chat/completions") {
                     bearerAuth(System.getenv("LITELLM_KEY") ?: "local")
                     contentType(ContentType.Application.Json)
-                    setBody(Json.encodeToString(body))
+                    setBody(JSONObject(mapOf(
+                        "model" to "local",
+                        "messages" to messages,
+                        "max_tokens" to 512
+                    )).toString())
                 }
 
                 val respBody = Json.decodeFromString<Map<String, Any>>(httpResponse.bodyAsText())

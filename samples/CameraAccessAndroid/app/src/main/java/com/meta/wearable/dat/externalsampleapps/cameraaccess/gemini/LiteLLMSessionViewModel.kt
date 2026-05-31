@@ -8,9 +8,12 @@ import androidx.lifecycle.viewModelScope
 import com.meta.wearable.dat.externalsampleapps.cameraaccess.openclaw.OpenClawBridge
 import com.meta.wearable.dat.externalsampleapps.cameraaccess.openclaw.OpenClawEventClient
 import com.meta.wearable.dat.externalsampleapps.cameraaccess.openclaw.OpenClawConnectionState
+import com.meta.wearable.dat.externalsampleapps.cameraaccess.openclaw.GeminiFunctionCall
 import com.meta.wearable.dat.externalsampleapps.cameraaccess.openclaw.ToolCallRouter
 import com.meta.wearable.dat.externalsampleapps.cameraaccess.openclaw.ToolCallStatus
+import com.meta.wearable.dat.externalsampleapps.cameraaccess.gemini.ToolCallResult
 import com.meta.wearable.dat.externalsampleapps.cameraaccess.settings.SettingsManager
+import org.json.JSONObject
 import com.meta.wearable.dat.externalsampleapps.cameraaccess.stream.StreamingMode
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -33,6 +36,7 @@ data class LiteLlmUiState(
     val isGeminiActive: Boolean = false,       // "AI active" toggle in StreamScreen
     val connectionState: LiteLlmConnectionState = LiteLlmConnectionState.Disconnected,
     val isModelSpeaking: Boolean = false,
+    val isRecording: Boolean = false,           // continuous listening capture state
     val errorMessage: String? = null,
     val userTranscript: String = "",
     val aiTranscript: String = "",
@@ -122,11 +126,29 @@ class LiteLLMSessionViewModel(application: Application) : AndroidViewModel(appli
             // Wire tool call handling
             toolCallRouter = ToolCallRouter(openClawBridge, viewModelScope)
 
-            localAudioService.onToolCall = { toolCall ->
-                for (call in toolCall.functionCalls) {
-                    toolCallRouter?.handleToolCall(call) { response ->
-                        localAudioService.sendToolResponse(response)
+            localAudioService.onToolCall = { toolCallPayload ->
+                val geminiCall = GeminiFunctionCall(
+                    id = toolCallPayload.id,
+                    name = toolCallPayload.name,
+                    args = try {
+                        JSONObject(toolCallPayload.arguments).let { obj ->
+                            obj.keys().asSequence().associateWith { obj.opt(it) }
+                        }
+                    } catch (e: Exception) {
+                        emptyMap()
                     }
+                )
+                toolCallRouter?.handleToolCall(geminiCall) { response ->
+                    // Parse JSONObject → ToolCallResult
+                    val toolResponse = response.optJSONObject("toolResponse")
+                        ?.optJSONArray("functionResponses")
+                        ?.optJSONObject(0)
+                    val resultId = toolResponse?.optString("id") ?: ""
+                    val resultObj = toolResponse?.optJSONObject("response")
+                    val resultStr = resultObj?.optString("result")
+                        ?: resultObj?.optString("error")
+                        ?: ""
+                    localAudioService.sendToolResponse(ToolCallResult(resultId, resultStr))
                 }
             }
 
@@ -203,7 +225,7 @@ class LiteLLMSessionViewModel(application: Application) : AndroidViewModel(appli
      * Sends the latest vision frame along with the next audio chunk.
      */
     fun sendVideoFrameIfThrottled(bitmap: Bitmap) {
-        if (!LocalAudioConfig.WHISPERX_URL.contains("localhost") && !LocalAudioConfig.WHISPERX_URL.contains("10.10"))) return
+        if (!LocalAudioConfig.WHISPERX_URL.contains("localhost") && !LocalAudioConfig.WHISPERX_URL.contains("10.10")) return
         if (!sessionActive) return
         if (_uiState.value.connectionState != LiteLlmConnectionState.Ready) return
 
