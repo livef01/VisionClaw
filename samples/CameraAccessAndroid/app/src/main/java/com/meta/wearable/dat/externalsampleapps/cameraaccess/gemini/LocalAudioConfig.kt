@@ -4,10 +4,10 @@ import android.content.Context
 import com.meta.wearable.dat.externalsampleapps.cameraaccess.openclaw.OpenClawBridge
 
 object LocalAudioConfig {
-    // LiteLLM endpoint (OpenAI-compatible) — VM 451
+    // LiteLLM endpoint (OpenAI-compatible)
     const val LITELLM_BASE_URL = "http://100.105.130.81:4000/v1"
 
-    // WhisperX transcription server — VM 451
+    // WhisperX transcription server
     const val WHISPERX_URL = "http://100.105.130.81:5000/transcribe_base64"
 
     // Android TTS — uses built-in engine via AudioTrack
@@ -15,7 +15,7 @@ object LocalAudioConfig {
 
     // OpenClaw gateway for tool calls / skill routing
     val openClawBridge: OpenClawBridge by lazy {
-        OpenClawBridge()
+        OpenClawBridge("ws://10.10.10.150:18790")
     }
 
     fun isConfigured(): Boolean = true
