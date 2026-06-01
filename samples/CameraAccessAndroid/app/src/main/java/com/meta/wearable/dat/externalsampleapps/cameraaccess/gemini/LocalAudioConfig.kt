@@ -15,7 +15,7 @@ object LocalAudioConfig {
 
     // OpenClaw gateway for tool calls / skill routing
     val openClawBridge: OpenClawBridge by lazy {
-        OpenClawBridge("ws://10.10.10.150:18790")
+        OpenClawBridge()
     }
 
     fun isConfigured(): Boolean = true
