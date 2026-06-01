@@ -1,13 +1,7 @@
 package com.meta.wearable.dat.externalsampleapps.cameraaccess.gemini
 
 import android.util.Base64
-import io.ktor.client.*
-import io.ktor.client.engine.cio.*
-import io.ktor.client.plugins.contentnegotiation.*
-import io.ktor.client.request.*
-import io.ktor.client.statement.*
-import io.ktor.http.*
-import io.ktor.serialization.kotlinx.json.*
+import com.google.gson.Gson
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -15,15 +9,22 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import kotlinx.serialization.Serializable
-import kotlinx.serialization.json.Json
-import org.json.JSONObject
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody
+import okhttp3.RequestBody.Companion.toRequestBody
+import java.util.concurrent.TimeUnit
 
 class LocalAudioService {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private val client = HttpClient(CIO) {
-        install(ContentNegotiation) { json(Json { ignoreUnknownKeys = true }) }
-    }
+    private val client = OkHttpClient.Builder()
+        .connectTimeout(30, TimeUnit.SECONDS)
+        .readTimeout(30, TimeUnit.SECONDS)
+        .writeTimeout(30, TimeUnit.SECONDS)
+        .build()
+    private val gson = Gson()
 
     sealed class PipelineEvent {
         data class Transcript(val text: String) : PipelineEvent()
@@ -38,16 +39,6 @@ class LocalAudioService {
 
     private val _events = MutableStateFlow<PipelineEvent?>(null)
     val events: StateFlow<PipelineEvent?> = _events
-
-    /** Extension to avoid ktor HttpHeadersMap.toMap() ambiguity */
-    private fun org.json.JSONObject.toMap(): Map<String, Any> {
-        val map = mutableMapOf<String, Any>()
-        for (key in keys()) {
-            @Suppress("UNCHECKED_CAST")
-            map[key as String] = get(key)
-        }
-        return map
-    }
 
     /** Called by LiteLLMSessionViewModel to route TTS audio to the TTS manager */
     var onResponseForTts: ((String) -> Unit)? = null
@@ -68,16 +59,22 @@ class LocalAudioService {
     }
 
     // ─── Step 1: PCM16 → WhisperX STT ─────────────────────────────────────────
+    private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
+
     suspend fun transcribe(pcmData: ByteArray): String? {
         return try {
             val base64Audio = Base64.encodeToString(pcmData, Base64.NO_WRAP)
-            val response: HttpResponse = client.post(LocalAudioConfig.WHISPERX_URL) {
-                contentType(ContentType.Application.Json)
-                setBody(JSONObject(mapOf("audio_base64" to base64Audio)).toString())
-            }
-
-            val body: Map<String, Any> = JSONObject(response.bodyAsText()).toMap()
-            val text = (body["text"] as? String) ?: ""
+            val bodyJson = gson.toJson(mapOf("audio_base64" to base64Audio))
+            val body: RequestBody = bodyJson.toRequestBody(JSON_MEDIA_TYPE)
+            val request = Request.Builder()
+                .url("${LocalAudioConfig.WHISPERX_URL}/transcribe_base64")
+                .post(body)
+                .build()
+            val response = client.newCall(request).execute()
+            val responseBody = response.body?.string() ?: "{}"
+            @Suppress("UNCHECKED_CAST")
+            val map: Map<String, Any?> = gson.fromJson(responseBody, Map::class.java) as Map<String, Any?>
+            val text = (map["text"] as? String) ?: ""
 
             _events.value = PipelineEvent.Transcript(text)
             text
@@ -107,23 +104,28 @@ class LocalAudioService {
                 ))
             }
 
-            val response: HttpResponse = client.post("${LocalAudioConfig.LITELLM_BASE_URL}/chat/completions") {
-                bearerAuth(System.getenv("LITELLM_KEY") ?: "local")
-                contentType(ContentType.Application.Json)
-                setBody(JSONObject(mapOf(
-                    "model" to "local",
-                    "messages" to messages,
-                    "max_tokens" to 512
-                )).toString())
-            }
-
-            val body: Map<String, Any> = JSONObject(response.bodyAsText()).toMap()
+            val requestBodyMap = mapOf(
+                "model" to "local",
+                "messages" to messages,
+                "max_tokens" to 512
+            )
+            val bodyJson = gson.toJson(requestBodyMap)
+            val body: RequestBody = bodyJson.toRequestBody(JSON_MEDIA_TYPE)
+            val request = Request.Builder()
+                .url("${LocalAudioConfig.LITELLM_BASE_URL}/chat/completions")
+                .addHeader("Authorization", "Bearer ${System.getenv("LITELLM_KEY") ?: "local"}")
+                .post(body)
+                .build()
+            val httpResponse = client.newCall(request).execute()
+            val responseBody = httpResponse.body?.string() ?: "{}"
+            @Suppress("UNCHECKED_CAST")
+            val responseMap: Map<String, Any?> = gson.fromJson(responseBody, Map::class.java) as Map<String, Any?>
 
             // Check for tool call in response
-            val toolCalls = body["choices"]?.let { choices ->
+            val toolCalls = responseMap["choices"]?.let { choices ->
                 (choices as? List<*>)?.firstOrNull()
-                    ?.let { (it as? Map<String, Any>)?.get("message") }
-                    ?.let { (it as? Map<String, Any>)?.get("tool_calls") }
+                    ?.let { (it as? Map<String, Any?>)?.get("message") }
+                    ?.let { (it as? Map<String, Any?>)?.get("tool_calls") }
             }
 
             if (toolCalls != null) {
@@ -131,10 +133,10 @@ class LocalAudioService {
                 return null
             }
 
-            val content = (body["choices"] as? List<*>)
+            val content = (responseMap["choices"] as? List<*>)
                 ?.firstOrNull()
-                ?.let { (it as? Map<String, Any>)?.get("message") }
-                ?.let { (it as? Map<String, Any>)?.get("content") } as? String
+                ?.let { (it as? Map<String, Any?>)?.get("message") }
+                ?.let { (it as? Map<String, Any?>)?.get("content") } as? String
 
             _events.value = PipelineEvent.LlmResponse(content ?: "")
             content
@@ -147,7 +149,7 @@ class LocalAudioService {
     // ─── Tool call handling ───────────────────────────────────────────────────
     private fun handleToolCalls(toolCalls: Any?) {
         try {
-            val calls = (toolCalls as? List<*>)?.mapNotNull { it as? Map<String, Any> } ?: return
+            val calls = (toolCalls as? List<*>)?.mapNotNull { (it as? Map<String, Any?>) } ?: return
             for (call in calls) {
                 val id = call["id"] as? String ?: continue
                 val func = call["function"] as? Map<String, Any?> ?: continue
@@ -175,21 +177,26 @@ class LocalAudioService {
                 }
 
                 // Continue conversation with tool result
-                val httpResponse: HttpResponse = client.post("${LocalAudioConfig.LITELLM_BASE_URL}/chat/completions") {
-                    bearerAuth(System.getenv("LITELLM_KEY") ?: "local")
-                    contentType(ContentType.Application.Json)
-                    setBody(JSONObject(mapOf(
-                        "model" to "local",
-                        "messages" to messages,
-                        "max_tokens" to 512
-                    )).toString())
-                }
-
-                val respBody: Map<String, Any> = JSONObject(httpResponse.bodyAsText()).toMap()
-                val content = (respBody["choices"] as? List<*>)
+                val reqBodyMap = mapOf(
+                    "model" to "local",
+                    "messages" to messages,
+                    "max_tokens" to 512
+                )
+                val bodyJson = gson.toJson(reqBodyMap)
+                val body: RequestBody = bodyJson.toRequestBody(JSON_MEDIA_TYPE)
+                val request = Request.Builder()
+                    .url("${LocalAudioConfig.LITELLM_BASE_URL}/chat/completions")
+                    .addHeader("Authorization", "Bearer ${System.getenv("LITELLM_KEY") ?: "local"}")
+                    .post(body)
+                    .build()
+                val httpResponse = client.newCall(request).execute()
+                val responseBody = httpResponse.body?.string() ?: "{}"
+                @Suppress("UNCHECKED_CAST")
+                val respMap: Map<String, Any?> = gson.fromJson(responseBody, Map::class.java) as Map<String, Any?>
+                val content = (respMap["choices"] as? List<*>)
                     ?.firstOrNull()
-                    ?.let { (it as? Map<String, Any>)?.get("message") }
-                    ?.let { (it as? Map<String, Any>)?.get("content") } as? String
+                    ?.let { (it as? Map<String, Any?>)?.get("message") }
+                    ?.let { (it as? Map<String, Any?>)?.get("content") } as? String
 
                 content?.let {
                     _events.value = PipelineEvent.LlmResponse(it)
@@ -228,7 +235,7 @@ class LocalAudioService {
     }
 
     fun close() {
-        client.close()
+        // OkHttpClient manages its own connection pool — no explicit close needed
     }
 
     companion object {
