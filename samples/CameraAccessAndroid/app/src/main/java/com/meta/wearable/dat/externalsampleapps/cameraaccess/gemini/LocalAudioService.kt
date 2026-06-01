@@ -39,6 +39,16 @@ class LocalAudioService {
     private val _events = MutableStateFlow<PipelineEvent?>(null)
     val events: StateFlow<PipelineEvent?> = _events
 
+    /** Extension to avoid ktor HttpHeadersMap.toMap() ambiguity */
+    private fun org.json.JSONObject.toMap(): Map<String, Any> {
+        val map = mutableMapOf<String, Any>()
+        for (key in keys()) {
+            @Suppress("UNCHECKED_CAST")
+            map[key as String] = get(key)
+        }
+        return map
+    }
+
     /** Called by LiteLLMSessionViewModel to route TTS audio to the TTS manager */
     var onResponseForTts: ((String) -> Unit)? = null
 
@@ -66,7 +76,7 @@ class LocalAudioService {
                 setBody(JSONObject(mapOf("audio_base64" to base64Audio)).toString())
             }
 
-            val body = Json.decodeFromString<Map<String, Any>>(response.bodyAsText())
+            val body: Map<String, Any> = JSONObject(response.bodyAsText()).toMap()
             val text = (body["text"] as? String) ?: ""
 
             _events.value = PipelineEvent.Transcript(text)
@@ -107,7 +117,7 @@ class LocalAudioService {
                 )).toString())
             }
 
-            val body = Json.decodeFromString<Map<String, Any>>(response.bodyAsText())
+            val body: Map<String, Any> = JSONObject(response.bodyAsText()).toMap()
 
             // Check for tool call in response
             val toolCalls = body["choices"]?.let { choices ->
@@ -175,7 +185,7 @@ class LocalAudioService {
                     )).toString())
                 }
 
-                val respBody = Json.decodeFromString<Map<String, Any>>(httpResponse.bodyAsText())
+                val respBody: Map<String, Any> = JSONObject(httpResponse.bodyAsText()).toMap()
                 val content = (respBody["choices"] as? List<*>)
                     ?.firstOrNull()
                     ?.let { (it as? Map<String, Any>)?.get("message") }
