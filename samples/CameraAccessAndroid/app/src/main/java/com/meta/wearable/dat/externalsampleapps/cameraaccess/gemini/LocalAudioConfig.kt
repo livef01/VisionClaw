@@ -5,10 +5,10 @@ import com.meta.wearable.dat.externalsampleapps.cameraaccess.openclaw.OpenClawBr
 
 object LocalAudioConfig {
     // LiteLLM endpoint (OpenAI-compatible)
-    const val LITELLM_BASE_URL = "http://100.105.130.81:4000/v1"
+    const val LITELLM_BASE_URL = "https://ads-opposition-proud-bush.trycloudflare.com/v1"
 
     // WhisperX transcription server
-    const val WHISPERX_URL = "http://100.105.130.81:5000/transcribe_base64"
+    const val WHISPERX_URL = "https://mineral-progressive-improve-theorem.trycloudflare.com"
 
     // Android TTS — uses built-in engine via AudioTrack
     const val TTS_ENGINE = "com.google.android.tts"
