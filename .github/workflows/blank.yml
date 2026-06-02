@@ -8,25 +8,60 @@ on:
     branches:
       - main
 
+# Opt into Node.js 24 for all actions — GitHub will force Node 24 by default
+# on 2026-06-16 and remove Node 20 on 2026-09-16.
+env:
+  FORCEJAVASCRIPTACTIONSTONODE24: 'true'
+
 jobs:
   build:
     runs-on: ubuntu-latest
+    # GITHUB_TOKEN is auto-injected; we need `packages: read` to fetch the
+    # Meta DAT Android SDK from https://maven.pkg.github.com/facebook/...
+    permissions:
+      contents: read
+      packages: read
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-java@v4
         with:
           java-version: '17'
           distribution: temurin
+
+      # The Android SDK is required to compile the app (compileSdk = 35).
+      # `gradle/actions/setup-gradle@v4` only configures Gradle, not the SDK.
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools tools platforms;android-35 build-tools;35.0.0'
+          accept-android-sdk-licenses: true
+
       - uses: gradle/actions/setup-gradle@v4
-      - run: |
-          cd samples/CameraAccessAndroid
-          echo \"github_token=${{ secrets.GITHUB_TOKEN }}\" >> local.properties
+        with:
+          # `cache-cleanup: always` runs the cleanup step even when the build
+          # fails, keeping the cache from accumulating dead entries across runs.
+          cache-cleanup: 'always'
+
+      - name: Write local.properties + stub Secrets.kt
+        working-directory: samples/CameraAccessAndroid
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - run: |
-          cd samples/CameraAccessAndroid
-          ./gradlew assembleDebug --no-daemon
-      - uses: actions/upload-artifact@v4
+        run: |
+          # github_token is read by settings.gradle.kts to auth GitHub Packages
+          echo "github_token=${GITHUB_TOKEN}" >> local.properties
+          # Secrets.kt is gitignored; the example file has safe placeholder
+          # values that let the build compile without real API keys.
+          cp app/src/main/java/com/meta/wearable/dat/externalsampleapps/cameraaccess/Secrets.kt.example \
+             app/src/main/java/com/meta/wearable/dat/externalsampleapps/cameraaccess/Secrets.kt
+
+      - name: Build Debug APK
+        working-directory: samples/CameraAccessAndroid
+        run: ./gradlew assembleDebug --no-daemon
+
+      - name: Upload Debug APK
+        uses: actions/upload-artifact@v4
         with:
           name: visionclaw-debug-apk
           path: samples/CameraAccessAndroid/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
