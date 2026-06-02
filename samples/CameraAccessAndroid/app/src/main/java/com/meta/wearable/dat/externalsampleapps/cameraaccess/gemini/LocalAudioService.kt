@@ -1,29 +1,28 @@
 package com.meta.wearable.dat.externalsampleapps.cameraaccess.gemini
 
 import android.util.Base64
-import io.ktor.client.*
-import io.ktor.client.engine.cio.*
-import io.ktor.client.plugins.contentnegotiation.*
-import io.ktor.client.request.*
-import io.ktor.client.statement.*
-import io.ktor.http.*
-import io.ktor.serialization.kotlinx.json.*
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
-import org.json.JSONObject
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.MultipartBody
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.asRequestBody
+import okhttp3.RequestBody.Companion.toRequestBody
+import java.io.File
+import java.io.FileOutputStream
 
 class LocalAudioService {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private val client = HttpClient(CIO) {
-        install(ContentNegotiation) { json(Json { ignoreUnknownKeys = true }) }
-    }
+    private val client = OkHttpClient.Builder().build()
 
     sealed class PipelineEvent {
         data class Transcript(val text: String) : PipelineEvent()
@@ -57,23 +56,47 @@ class LocalAudioService {
         }
     }
 
-    // ─── Step 1: PCM16 → WhisperX STT ─────────────────────────────────────────
+    // ─── Step 1: PCM16 → OpenWebUI WhisperX STT (multipart upload) ──────────────
     suspend fun transcribe(pcmData: ByteArray): String? {
-        return try {
-            val base64Audio = Base64.encodeToString(pcmData, Base64.NO_WRAP)
-            val response: HttpResponse = client.post(LocalAudioConfig.WHISPERX_URL) {
-                contentType(ContentType.Application.Json)
-                setBody(JSONObject(mapOf("audio_base64" to base64Audio)).toString())
+        return withContext(Dispatchers.IO) {
+            try {
+                // Write PCM to a temp file (required for multipart upload)
+                val tempFile = File.createTempFile("audio", ".wav")
+                FileOutputStream(tempFile).use { it.write(pcmData) }
+
+                val requestBody = MultipartBody.Builder()
+                    .setType(MultipartBody.FORM)
+                    .addFormDataPart("file", tempFile.name, tempFile.asRequestBody("audio/wav".toMediaType()))
+                    .addFormDataPart("model", "whisper")
+                    .build()
+
+                val request = Request.Builder()
+                    .url(LocalAudioConfig.WHISPERX_URL)
+                    .addHeader("Authorization", "Bearer ${LocalAudioConfig.OPEN_WEB_UI_API_KEY}")
+                    .post(requestBody)
+                    .build()
+
+                val response = client.newCall(request).execute()
+                val bodyStr = response.body?.string() ?: ""
+
+                tempFile.delete()
+
+                if (!response.isSuccessful) {
+                    _events.value = PipelineEvent.Error("OpenWebUI WhisperX error: ${response.code} $bodyStr")
+                    return@withContext null
+                }
+
+                // OpenWebUI returns { "text": "..." }
+                val json = Json { ignoreUnknownKeys = true }
+                val body = json.decodeFromString<Map<String, Any>>(bodyStr)
+                val text = (body["text"] as? String) ?: ""
+
+                _events.value = PipelineEvent.Transcript(text)
+                text
+            } catch (e: Exception) {
+                _events.value = PipelineEvent.Error("WhisperX error: ${e.message}")
+                null
             }
-
-            val body = Json.decodeFromString<Map<String, Any>>(response.bodyAsText())
-            val text = (body["text"] as? String) ?: ""
-
-            _events.value = PipelineEvent.Transcript(text)
-            text
-        } catch (e: Exception) {
-            _events.value = PipelineEvent.Error("WhisperX error: ${e.message}")
-            null
         }
     }
 
@@ -97,20 +120,27 @@ class LocalAudioService {
                 ))
             }
 
-            val response: HttpResponse = client.post("${LocalAudioConfig.LITELLM_BASE_URL}/chat/completions") {
-                bearerAuth(System.getenv("LITELLM_KEY") ?: "local")
-                contentType(ContentType.Application.Json)
-                setBody(JSONObject(mapOf(
-                    "model" to "local",
-                    "messages" to messages,
-                    "max_tokens" to 512
-                )).toString())
-            }
+            val body = Json.encodeToString(mapOf(
+                "model" to "local",
+                "messages" to messages,
+                "max_tokens" to 512
+            ))
 
-            val body = Json.decodeFromString<Map<String, Any>>(response.bodyAsText())
+            val request = Request.Builder()
+                .url("${LocalAudioConfig.LITELLM_BASE_URL}/chat/completions")
+                .addHeader("Authorization", "Bearer ${LocalAudioConfig.OPEN_WEB_UI_API_KEY}")
+                .addHeader("Content-Type", "application/json")
+                .post(body.toRequestBody("application/json".toMediaType()))
+                .build()
+
+            val response = client.newCall(request).execute()
+            val bodyStr = response.body?.string() ?: "{}"
+
+            val json = Json { ignoreUnknownKeys = true }
+            val bodyMap = json.decodeFromString<Map<String, Any>>(bodyStr)
 
             // Check for tool call in response
-            val toolCalls = body["choices"]?.let { choices ->
+            val toolCalls = bodyMap["choices"]?.let { choices ->
                 (choices as? List<*>)?.firstOrNull()
                     ?.let { (it as? Map<String, Any>)?.get("message") }
                     ?.let { (it as? Map<String, Any>)?.get("tool_calls") }
@@ -121,7 +151,7 @@ class LocalAudioService {
                 return null
             }
 
-            val content = (body["choices"] as? List<*>)
+            val content = (bodyMap["choices"] as? List<*>)
                 ?.firstOrNull()
                 ?.let { (it as? Map<String, Any>)?.get("message") }
                 ?.let { (it as? Map<String, Any>)?.get("content") } as? String
@@ -164,18 +194,24 @@ class LocalAudioService {
                     ))
                 }
 
-                // Continue conversation with tool result
-                val httpResponse: HttpResponse = client.post("${LocalAudioConfig.LITELLM_BASE_URL}/chat/completions") {
-                    bearerAuth(System.getenv("LITELLM_KEY") ?: "local")
-                    contentType(ContentType.Application.Json)
-                    setBody(JSONObject(mapOf(
-                        "model" to "local",
-                        "messages" to messages,
-                        "max_tokens" to 512
-                    )).toString())
-                }
+                val body = Json.encodeToString(mapOf(
+                    "model" to "local",
+                    "messages" to messages,
+                    "max_tokens" to 512
+                ))
 
-                val respBody = Json.decodeFromString<Map<String, Any>>(httpResponse.bodyAsText())
+                val request = Request.Builder()
+                    .url("${LocalAudioConfig.LITELLM_BASE_URL}/chat/completions")
+                    .addHeader("Authorization", "Bearer ${LocalAudioConfig.OPEN_WEB_UI_API_KEY}")
+                    .addHeader("Content-Type", "application/json")
+                    .post(body.toRequestBody("application/json".toMediaType()))
+                    .build()
+
+                val httpResponse = client.newCall(request).execute()
+                val respBodyStr = httpResponse.body?.string() ?: "{}"
+
+                val json = Json { ignoreUnknownKeys = true }
+                val respBody = json.decodeFromString<Map<String, Any>>(respBodyStr)
                 val content = (respBody["choices"] as? List<*>)
                     ?.firstOrNull()
                     ?.let { (it as? Map<String, Any>)?.get("message") }
@@ -222,9 +258,11 @@ class LocalAudioService {
     }
 
     companion object {
-        private const val SYSTEM_PROMPT = """You are a helpful voice assistant wearing smart glasses. Keep responses concise and conversational.
-The user is speaking to you via voice. Respond in a natural, brief way.
-You have access to tools for controlling smart home devices, querying information, and more."""
+        private const val SYSTEM_PROMPT = """
+            You are a helpful voice assistant wearing smart glasses. Keep responses concise and conversational.
+            The user is speaking to you via voice. Respond in a natural, brief way.
+            You have access to tools for controlling smart home devices, querying information, and more.
+        """.trimIndent()
     }
 }
 
