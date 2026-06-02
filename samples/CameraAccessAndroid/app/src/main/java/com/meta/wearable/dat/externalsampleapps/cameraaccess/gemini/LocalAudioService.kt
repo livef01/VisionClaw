@@ -10,10 +10,13 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import kotlinx.serialization.Serializable
 import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import okhttp3.RequestBody
+import okhttp3.RequestBody.Companion.asRequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
+import java.io.File
+import java.io.FileOutputStream
 import java.util.concurrent.TimeUnit
 
 class LocalAudioService {
@@ -58,23 +61,41 @@ class LocalAudioService {
         }
     }
 
-    // ─── Step 1: PCM16 → WhisperX STT ─────────────────────────────────────────
+    // ─── Step 1: PCM16 → OpenWebUI WhisperX STT (multipart upload) ──────────────
     private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
 
     suspend fun transcribe(pcmData: ByteArray): String? {
         return try {
-            val base64Audio = Base64.encodeToString(pcmData, Base64.NO_WRAP)
-            val bodyJson = gson.toJson(mapOf("audio_base64" to base64Audio))
-            val body: RequestBody = bodyJson.toRequestBody(JSON_MEDIA_TYPE)
-            val request = Request.Builder()
-                .url("${LocalAudioConfig.WHISPERX_URL}/transcribe_base64")
-                .post(body)
+            // Write PCM to a temp file (required for multipart upload)
+            val tempFile = File.createTempFile("audio", ".wav")
+            FileOutputStream(tempFile).use { it.write(pcmData) }
+
+            val requestBody = MultipartBody.Builder()
+                .setType(MultipartBody.FORM)
+                .addFormDataPart("file", tempFile.name, tempFile.asRequestBody("audio/wav".toMediaType()))
+                .addFormDataPart("model", "whisper")
                 .build()
+
+            val request = Request.Builder()
+                .url(LocalAudioConfig.WHISPERX_URL)
+                .addHeader("Authorization", "Bearer ${LocalAudioConfig.OPEN_WEB_UI_API_KEY}")
+                .post(requestBody)
+                .build()
+
             val response = client.newCall(request).execute()
-            val responseBody = response.body?.string() ?: "{}"
+            val bodyStr = response.body?.string() ?: ""
+
+            tempFile.delete()
+
+            if (!response.isSuccessful) {
+                _events.value = PipelineEvent.Error("OpenWebUI WhisperX error: ${response.code} $bodyStr")
+                return null
+            }
+
+            // OpenWebUI returns { "text": "..." }
             @Suppress("UNCHECKED_CAST")
-            val map: Map<String, Any?> = gson.fromJson(responseBody, Map::class.java) as Map<String, Any?>
-            val text = (map["text"] as? String) ?: ""
+            val body = gson.fromJson(bodyStr, Map::class.java) as Map<String, Any?>
+            val text = (body["text"] as? String) ?: ""
 
             _events.value = PipelineEvent.Transcript(text)
             text
@@ -110,12 +131,14 @@ class LocalAudioService {
                 "max_tokens" to 512
             )
             val bodyJson = gson.toJson(requestBodyMap)
-            val body: RequestBody = bodyJson.toRequestBody(JSON_MEDIA_TYPE)
+            val body: okhttp3.RequestBody = bodyJson.toRequestBody(JSON_MEDIA_TYPE)
+
             val request = Request.Builder()
                 .url("${LocalAudioConfig.LITELLM_BASE_URL}/chat/completions")
-                .addHeader("Authorization", "Bearer ${System.getenv("LITELLM_KEY") ?: "local"}")
+                .addHeader("Authorization", "Bearer ${LocalAudioConfig.OPEN_WEB_UI_API_KEY}")
                 .post(body)
                 .build()
+
             val httpResponse = client.newCall(request).execute()
             val responseBody = httpResponse.body?.string() ?: "{}"
             @Suppress("UNCHECKED_CAST")
@@ -176,19 +199,20 @@ class LocalAudioService {
                     ))
                 }
 
-                // Continue conversation with tool result
                 val reqBodyMap = mapOf(
                     "model" to "local",
                     "messages" to messages,
                     "max_tokens" to 512
                 )
                 val bodyJson = gson.toJson(reqBodyMap)
-                val body: RequestBody = bodyJson.toRequestBody(JSON_MEDIA_TYPE)
+                val body: okhttp3.RequestBody = bodyJson.toRequestBody(JSON_MEDIA_TYPE)
+
                 val request = Request.Builder()
                     .url("${LocalAudioConfig.LITELLM_BASE_URL}/chat/completions")
-                    .addHeader("Authorization", "Bearer ${System.getenv("LITELLM_KEY") ?: "local"}")
+                    .addHeader("Authorization", "Bearer ${LocalAudioConfig.OPEN_WEB_UI_API_KEY}")
                     .post(body)
                     .build()
+
                 val httpResponse = client.newCall(request).execute()
                 val responseBody = httpResponse.body?.string() ?: "{}"
                 @Suppress("UNCHECKED_CAST")

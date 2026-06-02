@@ -225,7 +225,7 @@ class LiteLLMSessionViewModel(application: Application) : AndroidViewModel(appli
      * Sends the latest vision frame along with the next audio chunk.
      */
     fun sendVideoFrameIfThrottled(bitmap: Bitmap) {
-        if (!LocalAudioConfig.WHISPERX_URL.contains("localhost") && !LocalAudioConfig.WHISPERX_URL.contains("10.10")) return
+        if (LocalAudioConfig.WHISPERX_URL.contains("localhost") || LocalAudioConfig.WHISPERX_URL.contains("10.10")) return
         if (!sessionActive) return
         if (_uiState.value.connectionState != LiteLlmConnectionState.Ready) return
 
