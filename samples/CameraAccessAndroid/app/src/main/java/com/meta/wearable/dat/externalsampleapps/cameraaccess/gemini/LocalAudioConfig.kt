@@ -1,8 +1,10 @@
 package com.meta.wearable.dat.externalsampleapps.cameraaccess.gemini
 
-import android.content.Context
-import com.meta.wearable.dat.externalsampleapps.cameraaccess.openclaw.OpenClawBridge
-
+/**
+ * Endpoints and shared constants for the local audio pipeline
+ * (WhisperX STT → LiteLLM → Android TTS). The actual `OpenClawBridge` instance
+ * is owned by the ViewModel that needs it; this object is purely config.
+ */
 object LocalAudioConfig {
     // LiteLLM endpoint (OpenAI-compatible)
     const val LITELLM_BASE_URL = "http://10.10.10.150:18790/v1"
@@ -12,11 +14,6 @@ object LocalAudioConfig {
 
     // Android TTS — uses built-in engine via AudioTrack
     const val TTS_ENGINE = "com.google.android.tts"
-
-    // OpenClaw gateway for tool calls / skill routing
-    val openClawBridge: OpenClawBridge by lazy {
-        OpenClawBridge("ws://10.10.10.150:18790")
-    }
 
     fun isConfigured(): Boolean = true
 }

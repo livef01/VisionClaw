@@ -1,28 +1,36 @@
 package com.meta.wearable.dat.externalsampleapps.cameraaccess.gemini
 
 import android.util.Base64
-import io.ktor.client.*
-import io.ktor.client.engine.cio.*
-import io.ktor.client.plugins.contentnegotiation.*
-import io.ktor.client.request.*
-import io.ktor.client.statement.*
-import io.ktor.http.*
-import io.ktor.serialization.kotlinx.json.*
+import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
-import kotlinx.serialization.Serializable
-import kotlinx.serialization.json.Json
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.Response
+import org.json.JSONArray
+import org.json.JSONObject
 
+/**
+ * Pipeline: PCM16 → WhisperX STT → LiteLLM (with tool calls) → TTS callback.
+ *
+ * Uses OkHttp + org.json (same stack as OpenClawBridge) so the project doesn't
+ * pull in an extra HTTP client. Tool-call routing goes through
+ * LiteLLMSessionViewModel, which delegates to ToolCallRouter.
+ */
 class LocalAudioService {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private val client = HttpClient(CIO) {
-        install(ContentNegotiation) { json(Json { ignoreUnknownKeys = true }) }
-    }
+
+    private val client = OkHttpClient.Builder()
+        .readTimeout(120, TimeUnit.SECONDS)
+        .connectTimeout(10, TimeUnit.SECONDS)
+        .build()
 
     sealed class PipelineEvent {
         data class Transcript(val text: String) : PipelineEvent()
@@ -41,7 +49,7 @@ class LocalAudioService {
     /** Called by LiteLLMSessionViewModel to route TTS audio to the TTS manager */
     var onResponseForTts: ((String) -> Unit)? = null
 
-    /** Called when LLM emits a function call */
+    /** Called when LLM emits a function call (invoked once per call) */
     var onToolCall: ((ToolCallPayload) -> Unit)? = null
 
     // Vision frames queue — prepended to the next chat completion message
@@ -60,73 +68,70 @@ class LocalAudioService {
     suspend fun transcribe(pcmData: ByteArray): String? {
         return try {
             val base64Audio = Base64.encodeToString(pcmData, Base64.NO_WRAP)
-            val response: HttpResponse = client.post(LocalAudioConfig.WHISPERX_URL) {
-                contentType(ContentType.Application.Json)
-                setBody(Json.encodeToString(mapOf("audio" to base64Audio)))
+            val body = JSONObject().put("audio", base64Audio).toString()
+
+            val request = Request.Builder()
+                .url(LocalAudioConfig.WHISPERX_URL)
+                .post(body.toRequestBody(JSON))
+                .build()
+
+            client.newCall(request).execute().use { response ->
+                val text = parseTranscript(response)
+                _events.value = PipelineEvent.Transcript(text)
+                text
             }
-
-            val body = Json.decodeFromString<Map<String, Any>>(response.bodyAsText())
-            val text = (body["text"] as? String) ?: ""
-
-            _events.value = PipelineEvent.Transcript(text)
-            text
         } catch (e: Exception) {
             _events.value = PipelineEvent.Error("WhisperX error: ${e.message}")
             null
         }
     }
 
+    private fun parseTranscript(response: Response): String {
+        if (!response.isSuccessful) return ""
+        val body = response.body?.string() ?: return ""
+        return JSONObject(body).optString("text", "")
+    }
+
     // ─── Step 2: Transcript → LiteLLM ─────────────────────────────────────────
     suspend fun generateResponse(transcript: String): String? {
         return try {
             val frames = synchronized(visionFrames) { visionFrames.toList() }
-            val messages = buildList {
-                add(mapOf("role" to "system", "content" to SYSTEM_PROMPT))
-                add(mapOf(
-                    "role" to "user",
-                    "content" to buildList {
-                        add(mapOf("type" to "text", "text" to transcript))
-                        frames.forEach { frame ->
-                            add(mapOf(
-                                "type" to "image_url",
-                                "image_url" to mapOf("url" to "data:image/jpeg;base64,$frame")
-                            ))
-                        }
-                    }
-                ))
+
+            val messagesArray = JSONArray()
+            messagesArray.put(systemMessage())
+            messagesArray.put(userMessageWithFrames(transcript, frames))
+
+            val body = JSONObject().apply {
+                put("model", "local")
+                put("messages", messagesArray)
+                put("max_tokens", 512)
+            }.toString()
+
+            val request = Request.Builder()
+                .url("${LocalAudioConfig.LITELLM_BASE_URL}/chat/completions")
+                .post(body.toRequestBody(JSON))
+                .addHeader("Authorization", "Bearer ${System.getenv("LITELLM_KEY") ?: "local"}")
+                .build()
+
+            client.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) {
+                    _events.value = PipelineEvent.Error("LiteLLM HTTP ${response.code}")
+                    return null
+                }
+                val respBody = response.body?.string().orEmpty()
+                val json = JSONObject(respBody)
+
+                // Check for tool call in response
+                val toolCalls = firstChoice(json)?.optJSONArray("tool_calls")
+                if (toolCalls != null && toolCalls.length() > 0) {
+                    handleToolCalls(toolCalls)
+                    return null
+                }
+
+                val content = firstMessage(json)?.optString("content", "").orEmpty()
+                _events.value = PipelineEvent.LlmResponse(content)
+                content
             }
-
-            val response: HttpResponse = client.post("${LocalAudioConfig.LITELLM_BASE_URL}/chat/completions") {
-                bearerAuth(System.getenv("LITELLM_KEY") ?: "local")
-                contentType(ContentType.Application.Json)
-                setBody(Json.encodeToString(mapOf(
-                    "model" to "local",
-                    "messages" to messages,
-                    "max_tokens" to 512
-                )))
-            }
-
-            val body = Json.decodeFromString<Map<String, Any>>(response.bodyAsText())
-
-            // Check for tool call in response
-            val toolCalls = body["choices"]?.let { choices ->
-                (choices as? List<*>)?.firstOrNull()
-                    ?.let { (it as? Map<String, Any>)?.get("message") }
-                    ?.let { (it as? Map<String, Any>)?.get("tool_calls") }
-            }
-
-            if (toolCalls != null) {
-                handleToolCalls(toolCalls)
-                return null
-            }
-
-            val content = (body["choices"] as? List<*>)
-                ?.firstOrNull()
-                ?.let { (it as? Map<String, Any>)?.get("message") }
-                ?.let { (it as? Map<String, Any>)?.get("content") } as? String
-
-            _events.value = PipelineEvent.LlmResponse(content ?: "")
-            content
         } catch (e: Exception) {
             _events.value = PipelineEvent.Error("LiteLLM error: ${e.message}")
             null
@@ -134,14 +139,14 @@ class LocalAudioService {
     }
 
     // ─── Tool call handling ───────────────────────────────────────────────────
-    private fun handleToolCalls(toolCalls: Any?) {
+    private fun handleToolCalls(toolCalls: JSONArray) {
         try {
-            val calls = (toolCalls as? List<*>)?.mapNotNull { it as? Map<String, Any> } ?: return
-            for (call in calls) {
-                val id = call["id"] as? String ?: continue
-                val func = call["function"] as? Map<String, Any?> ?: continue
-                val name = func["name"] as? String ?: continue
-                val args = func["arguments"] as? String ?: "{}"
+            for (i in 0 until toolCalls.length()) {
+                val call = toolCalls.optJSONObject(i) ?: continue
+                val id = call.optString("id", "").ifEmpty { continue }
+                val func = call.optJSONObject("function") ?: continue
+                val name = func.optString("name", "").ifEmpty { continue }
+                val args = func.optString("arguments", "{}")
                 onToolCall?.invoke(ToolCallPayload(id, name, args))
             }
         } catch (e: Exception) {
@@ -149,42 +154,76 @@ class LocalAudioService {
         }
     }
 
-    fun sendToolResponse(response: ToolCallResult) {
+    /**
+     * Continue the conversation with a tool result. The router builds a JSON
+     * `toolResponse` envelope and we extract the first function response,
+     * inject it as a `role: "tool"` message (OpenAI-compatible), and hand the
+     * augmented messages to LiteLLM.
+     *
+     * Envelope shape (from ToolCallRouter.buildToolResponse):
+     *   { "toolResponse": { "functionResponses": [{ "id": "...", "name": "...",
+     *                          "response": { "result": "..." } | { "error": "..." } }] } }
+     */
+    fun sendToolResponse(response: JSONObject) {
         scope.launch {
             try {
-                val messages = buildList {
-                    add(mapOf("role" to "system", "content" to SYSTEM_PROMPT))
-                    add(mapOf(
-                        "role" to "user",
-                        "content" to listOf(mapOf(
-                            "type" to "text",
-                            "text" to "Continue."
-                        ))
-                    ))
+                val firstFnResponse = response
+                    .optJSONObject("toolResponse")
+                    ?.optJSONArray("functionResponses")
+                    ?.optJSONObject(0)
+                val toolCallId = firstFnResponse?.optString("id", "").orEmpty()
+                val resultObj = firstFnResponse?.optJSONObject("response")
+                val content = when {
+                    resultObj == null -> ""
+                    resultObj.has("result") -> resultObj.optString("result")
+                    resultObj.has("error") -> "Error: ${resultObj.optString("error")}"
+                    else -> resultObj.toString()
                 }
 
-                // Continue conversation with tool result
-                val body = mapOf(
-                    "model" to "local",
-                    "messages" to messages,
-                    "max_tokens" to 512
-                )
-
-                val httpResponse: HttpResponse = client.post("${LocalAudioConfig.LITELLM_BASE_URL}/chat/completions") {
-                    bearerAuth(System.getenv("LITELLM_KEY") ?: "local")
-                    contentType(ContentType.Application.Json)
-                    setBody(Json.encodeToString(body))
+                val messagesArray = JSONArray()
+                messagesArray.put(systemMessage())
+                if (toolCallId.isNotEmpty()) {
+                    messagesArray.put(JSONObject().apply {
+                        put("role", "tool")
+                        put("tool_call_id", toolCallId)
+                        put("content", content)
+                    })
+                } else {
+                    // Fall back to a user "continue" prompt when the envelope
+                    // shape is unrecognized — preserves prior behavior.
+                    messagesArray.put(JSONObject().apply {
+                        put("role", "user")
+                        put("content", JSONArray().put(JSONObject().apply {
+                            put("type", "text")
+                            put("text", "Continue.")
+                        }))
+                    })
                 }
 
-                val respBody = Json.decodeFromString<Map<String, Any>>(httpResponse.bodyAsText())
-                val content = (respBody["choices"] as? List<*>)
-                    ?.firstOrNull()
-                    ?.let { (it as? Map<String, Any>)?.get("message") }
-                    ?.let { (it as? Map<String, Any>)?.get("content") } as? String
+                val body = JSONObject().apply {
+                    put("model", "local")
+                    put("messages", messagesArray)
+                    put("max_tokens", 512)
+                }.toString()
 
-                content?.let {
-                    _events.value = PipelineEvent.LlmResponse(it)
-                    onResponseForTts?.invoke(it)
+                val request = Request.Builder()
+                    .url("${LocalAudioConfig.LITELLM_BASE_URL}/chat/completions")
+                    .post(body.toRequestBody(JSON))
+                    .addHeader("Authorization", "Bearer ${System.getenv("LITELLM_KEY") ?: "local"}")
+                    .build()
+
+                client.newCall(request).execute().use { httpResponse ->
+                    if (!httpResponse.isSuccessful) {
+                        _events.value = PipelineEvent.Error("Tool response HTTP ${httpResponse.code}")
+                        return@launch
+                    }
+                    val respBody = httpResponse.body?.string().orEmpty()
+                    val json = JSONObject(respBody)
+                    val nextContent = firstMessage(json)?.optString("content", "").orEmpty()
+                    if (nextContent.isNotEmpty()) {
+                        _events.value = PipelineEvent.LlmResponse(nextContent)
+                        onResponseForTts?.invoke(nextContent)
+                    }
                 }
             } catch (e: Exception) {
                 _events.value = PipelineEvent.Error("Tool response error: ${e.message}")
@@ -219,10 +258,41 @@ class LocalAudioService {
     }
 
     fun close() {
-        client.close()
+        client.dispatcher.executorService.shutdown()
     }
 
+    // ─── JSON helpers ─────────────────────────────────────────────────────────
+    private fun systemMessage(): JSONObject = JSONObject().apply {
+        put("role", "system")
+        put("content", SYSTEM_PROMPT)
+    }
+
+    private fun userMessageWithFrames(transcript: String, frames: List<String>): JSONObject {
+        val content = JSONArray()
+        content.put(JSONObject().apply {
+            put("type", "text")
+            put("text", transcript)
+        })
+        for (frame in frames) {
+            content.put(JSONObject().apply {
+                put("type", "image_url")
+                put("image_url", JSONObject().put("url", "data:image/jpeg;base64,$frame"))
+            })
+        }
+        return JSONObject().apply {
+            put("role", "user")
+            put("content", content)
+        }
+    }
+
+    private fun firstChoice(json: JSONObject): JSONObject? =
+        json.optJSONArray("choices")?.optJSONObject(0)
+
+    private fun firstMessage(json: JSONObject): JSONObject? =
+        firstChoice(json)?.optJSONObject("message")
+
     companion object {
+        private val JSON = "application/json; charset=utf-8".toMediaType()
         private const val SYSTEM_PROMPT = """
             You are a helpful voice assistant wearing smart glasses. Keep responses concise and conversational.
             The user is speaking to you via voice. Respond in a natural, brief way.
@@ -231,15 +301,9 @@ class LocalAudioService {
     }
 }
 
-@Serializable
+/** Lightweight payload for one tool call (id + name + JSON-encoded args). */
 data class ToolCallPayload(
     val id: String,
     val name: String,
     val arguments: String
-)
-
-@Serializable
-data class ToolCallResult(
-    val id: String,
-    val result: String
 )

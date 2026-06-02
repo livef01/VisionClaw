@@ -5,6 +5,7 @@ import android.graphics.Bitmap
 import android.util.Base64
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.meta.wearable.dat.externalsampleapps.cameraaccess.openclaw.GeminiFunctionCall
 import com.meta.wearable.dat.externalsampleapps.cameraaccess.openclaw.OpenClawBridge
 import com.meta.wearable.dat.externalsampleapps.cameraaccess.openclaw.OpenClawEventClient
 import com.meta.wearable.dat.externalsampleapps.cameraaccess.openclaw.OpenClawConnectionState
@@ -19,6 +20,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import org.json.JSONObject
 
 // ─── Connection state (mirrors GeminiConnectionState for UI compatibility) ───
 sealed class LiteLlmConnectionState {
@@ -33,6 +35,7 @@ data class LiteLlmUiState(
     val isGeminiActive: Boolean = false,       // "AI active" toggle in StreamScreen
     val connectionState: LiteLlmConnectionState = LiteLlmConnectionState.Disconnected,
     val isModelSpeaking: Boolean = false,
+    val isRecording: Boolean = false,          // mic is actively capturing audio
     val errorMessage: String? = null,
     val userTranscript: String = "",
     val aiTranscript: String = "",
@@ -123,10 +126,17 @@ class LiteLLMSessionViewModel(application: Application) : AndroidViewModel(appli
             toolCallRouter = ToolCallRouter(openClawBridge, viewModelScope)
 
             localAudioService.onToolCall = { toolCall ->
-                for (call in toolCall.functionCalls) {
-                    toolCallRouter?.handleToolCall(call) { response ->
-                        localAudioService.sendToolResponse(response)
-                    }
+                // LocalAudioService invokes this callback once per parsed tool
+                // call (not per batch), so we route each ToolCallPayload straight
+                // to the router — the router expects a GeminiFunctionCall.
+                val args = parseArgsJson(toolCall.arguments)
+                val functionCall = GeminiFunctionCall(
+                    id = toolCall.id,
+                    name = toolCall.name,
+                    args = args,
+                )
+                toolCallRouter?.handleToolCall(functionCall) { response ->
+                    localAudioService.sendToolResponse(response)
                 }
             }
 
@@ -228,5 +238,25 @@ class LiteLLMSessionViewModel(application: Application) : AndroidViewModel(appli
         stopSession()
         localTtsManager.shutdown()
         localAudioService.close()
+    }
+
+    /**
+     * Parses a JSON-encoded args string (e.g. `{"task": "..."}`) into the
+     * `Map<String, Any?>` shape that `GeminiFunctionCall` expects. Returns
+     * an empty map when the string is missing or malformed, which the router
+     * treats as "no args".
+     */
+    private fun parseArgsJson(argsJson: String?): Map<String, Any?> {
+        if (argsJson.isNullOrBlank()) return emptyMap()
+        return try {
+            val obj = JSONObject(argsJson)
+            buildMap {
+                for (key in obj.keys()) {
+                    put(key, obj.opt(key))
+                }
+            }
+        } catch (e: Exception) {
+            emptyMap()
+        }
     }
 }
