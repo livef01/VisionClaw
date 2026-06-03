@@ -143,9 +143,11 @@ class LocalAudioService {
         try {
             for (i in 0 until toolCalls.length()) {
                 val call = toolCalls.optJSONObject(i) ?: continue
-                val id = call.optString("id", "").ifEmpty { continue }
+                val id = call.optString("id")
+                if (id.isEmpty()) continue
                 val func = call.optJSONObject("function") ?: continue
-                val name = func.optString("name", "").ifEmpty { continue }
+                val name = func.optString("name")
+                if (name.isEmpty()) continue
                 val args = func.optString("arguments", "{}")
                 onToolCall?.invoke(ToolCallPayload(id, name, args))
             }
@@ -293,7 +295,7 @@ class LocalAudioService {
 
     companion object {
         private val JSON = "application/json; charset=utf-8".toMediaType()
-        private const val SYSTEM_PROMPT = """
+        private val SYSTEM_PROMPT = """
             You are a helpful voice assistant wearing smart glasses. Keep responses concise and conversational.
             The user is speaking to you via voice. Respond in a natural, brief way.
             You have access to tools for controlling smart home devices, querying information, and more.
