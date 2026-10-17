@@ -1,6 +1,7 @@
 package com.meta.wearable.dat.externalsampleapps.cameraaccess.gemini
 
 import android.util.Base64
+import android.util.Log
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -15,6 +16,8 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import org.json.JSONArray
 import org.json.JSONObject
+
+private const val TAG = "LocalAudioService"
 
 /**
  * Pipeline: PCM16 → WhisperX STT → LiteLLM (with tool calls) → TTS callback.
@@ -107,19 +110,31 @@ class LocalAudioService {
                 put("max_tokens", 512)
             }.toString()
 
+            val targetUrl = "${LocalAudioConfig.LITELLM_BASE_URL}/chat/completions"
+            val endpointHost = try {
+                java.net.URI(targetUrl).host ?: "unknown"
+            } catch (_: Exception) {
+                "unknown"
+            }
+
+            Log.d(TAG, "LiteLLM request → $targetUrl")
+
             val request = Request.Builder()
-                .url("${LocalAudioConfig.LITELLM_BASE_URL}/chat/completions")
+                .url(targetUrl)
                 .post(body.toRequestBody(JSON))
                 .addHeader("Authorization", "Bearer ${System.getenv("LITELLM_KEY") ?: "local"}")
                 .build()
 
             client.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) {
+                    Log.w(TAG, "LiteLLM HTTP error: ${response.code}")
                     _events.value = PipelineEvent.Error("LiteLLM HTTP ${response.code}")
                     return null
                 }
                 val respBody = response.body?.string().orEmpty()
                 val json = JSONObject(respBody)
+
+                Log.d(TAG, "LiteLLM response from $endpointHost received (${respBody.length} chars)")
 
                 // Check for tool call in response
                 val toolCalls = firstChoice(json)?.optJSONArray("tool_calls")
@@ -128,7 +143,8 @@ class LocalAudioService {
                     return null
                 }
 
-                val content = firstMessage(json)?.optString("content", "").orEmpty()
+                val rawContent = firstMessage(json)?.optString("content", "").orEmpty()
+                val content = LocalAudioConfig.stripThinkTags(rawContent)
                 _events.value = PipelineEvent.LlmResponse(content)
                 content
             }
@@ -223,8 +239,11 @@ class LocalAudioService {
                     val json = JSONObject(respBody)
                     val nextContent = firstMessage(json)?.optString("content", "").orEmpty()
                     if (nextContent.isNotEmpty()) {
-                        _events.value = PipelineEvent.LlmResponse(nextContent)
-                        onResponseForTts?.invoke(nextContent)
+                        val cleaned = LocalAudioConfig.stripThinkTags(nextContent)
+                        if (cleaned.isNotEmpty()) {
+                            _events.value = PipelineEvent.LlmResponse(cleaned)
+                            onResponseForTts?.invoke(cleaned)
+                        }
                     }
                 }
             } catch (e: Exception) {

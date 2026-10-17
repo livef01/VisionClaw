@@ -69,11 +69,12 @@ class LiteLLMSessionViewModel(application: Application) : AndroidViewModel(appli
     init {
         localTtsManager.init()
 
-        // Wire TTS callback into the pipeline
-        localAudioService.onResponseForTts = { text ->
-            localTtsManager.speak(text)
+        // Wire TTS callback into the pipeline — strip think tags before TTS and UI
+        localAudioService.onResponseForTts = { rawText ->
+            val cleaned = LocalAudioConfig.stripThinkTags(rawText)
+            localTtsManager.speak(cleaned)
             _uiState.value = _uiState.value.copy(
-                aiTranscript = text,
+                aiTranscript = cleaned,
                 isModelSpeaking = false,
             )
         }
