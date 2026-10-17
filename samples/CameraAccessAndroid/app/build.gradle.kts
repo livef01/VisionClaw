@@ -79,4 +79,5 @@ dependencies {
   androidTestImplementation(libs.androidx.ui.test.junit4)
   androidTestImplementation(libs.androidx.test.uiautomator)
   androidTestImplementation(libs.androidx.test.rules)
+  testImplementation("junit:junit:4.13.2")
 }

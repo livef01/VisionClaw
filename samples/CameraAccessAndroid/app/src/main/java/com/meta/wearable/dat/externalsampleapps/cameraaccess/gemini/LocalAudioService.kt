@@ -2,6 +2,7 @@ package com.meta.wearable.dat.externalsampleapps.cameraaccess.gemini
 
 import android.util.Base64
 import android.util.Log
+import com.meta.wearable.dat.externalsampleapps.cameraaccess.Secrets
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -122,7 +123,7 @@ class LocalAudioService {
             val request = Request.Builder()
                 .url(targetUrl)
                 .post(body.toRequestBody(JSON))
-                .addHeader("Authorization", "Bearer ${System.getenv("LITELLM_KEY") ?: "local"}")
+                .addHeader("Authorization", "Bearer ${Secrets.liteLLMKey}")
                 .build()
 
             client.newCall(request).execute().use { response ->
@@ -227,7 +228,7 @@ class LocalAudioService {
                 val request = Request.Builder()
                     .url("${LocalAudioConfig.LITELLM_BASE_URL}/chat/completions")
                     .post(body.toRequestBody(JSON))
-                    .addHeader("Authorization", "Bearer ${System.getenv("LITELLM_KEY") ?: "local"}")
+                    .addHeader("Authorization", "Bearer ${Secrets.liteLLMKey}")
                     .build()
 
                 client.newCall(request).execute().use { httpResponse ->

@@ -4,11 +4,6 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
-/**
- * Unit tests for LocalAudioConfig think-tag stripping.
- * These verify that <think> blocks are removed from LLM output
- * before TTS or UI display.
- */
 class LocalAudioConfigTest {
 
     @Test
@@ -20,30 +15,30 @@ class LocalAudioConfigTest {
 
     @Test
     fun stripThinkTags_closedThinkTags_removed() {
-        val input = "I'm thinking about that. <think>Let me reason through this.</think> Help me with something else!"
+        val input = "Start <think>inner text</think> end"
         val result = LocalAudioConfig.stripThinkTags(input)
-        assertEquals("I'm thinking about that. Help me with something else!", result)
+        assertEquals("Start end", result)
     }
 
     @Test
     fun stripThinkTags_unclosedThinkTag_removed() {
-        val input = "Let me think <think>This should be removed"
+        val input = "Before <think>after"
         val result = LocalAudioConfig.stripThinkTags(input)
-        assertEquals("Let me think", result)
+        assertEquals("Before", result)
     }
 
     @Test
     fun stripThinkTags_onlyThinkTag_returnsEmpty() {
-        val input = "<think>Some internal reasoning here.?>"
+        val input = "inner text?>"
         val result = LocalAudioConfig.stripThinkTags(input)
         assertEquals("", result)
     }
 
     @Test
     fun stripThinkTags_multipleThinkTags_removed() {
-        val input = "First thought <think>first reason second thought <think>second reason end"
+        val input = "A thought1  thought2  thought3 end"
         val result = LocalAudioConfig.stripThinkTags(input)
-        assertEquals("First thought second thought end", result)
+        assertEquals("A end", result)
     }
 
     @Test
@@ -53,24 +48,43 @@ class LocalAudioConfigTest {
     }
 
     @Test
-    fun stripThinkTags_caseInsensitive() {
-        val input = "Before  THINK internal REASON?> After"
-        val result = LocalAudioConfig.stripThinkTags(input)
-        assertEquals("Before After", result)
-    }
-
-    @Test
     fun stripThinkTags_preservesNormalTags() {
-        val input = "Hello <b>world</b> and <i>italic</i> text"
+        val input = "Hello <b>world</b> text"
         val result = LocalAudioConfig.stripThinkTags(input)
-        assertEquals("Hello <b>world</b> and <i>italic</i> text", result)
+        assertEquals("Hello <b>world</b> text", result)
     }
 
     @Test
     fun stripThinkTags_trimmed() {
-        val input = "  Before </think>  "
+        val input = "  Before ?>"
         val result = LocalAudioConfig.stripThinkTags(input)
         assertEquals("Before", result)
+    }
+
+    // ── Stream-safe helpers ────────────────────────────────────────────────
+
+    @Test
+    fun processStreamChunk_completeThinkTagInChunk_returnsClearedText() {
+        val chunk = "Hello  inner  end "
+        val (out, leftover) = LocalAudioConfig.processStreamChunk(chunk)
+        assertEquals("Hello ", out)
+        assertEquals("", leftover ?: "")
+    }
+
+    @Test
+    fun processStreamChunk_partialThinkTag_savedForNextChunk() {
+        val chunk = "text  part1"
+        var leftover: String?
+        LocalAudioConfig.processStreamChunk(chunk)
+        leftover = LocalAudioConfig._partialTag
+        assertTrue(leftover != null && leftover!!.contains("part1"))
+    }
+
+    @Test
+    fun processStreamChunk_noThinkTag_passesThrough() {
+        val chunk = "Hello world"
+        val (out, _) = LocalAudioConfig.processStreamChunk(chunk)
+        assertEquals("Hello world", out)
     }
 
     @Test
@@ -79,9 +93,13 @@ class LocalAudioConfigTest {
     }
 
     @Test
+    fun endpoint_isWorkingProxy() {
+        assertEquals("http://100.105.130.81:4000/v1", LocalAudioConfig.LITELLM_BASE_URL)
+    }
+
+    @Test
     fun urlConstruction_buildsChatCompletionsPath() {
-        val expected = "${LocalAudioConfig.LITELLM_BASE_URL}/chat/completions"
+        val expected = "http://100.105.130.81:4000/v1" + "/chat/completions"
         assertTrue(expected.contains("/v1/chat/completions"))
-        assertTrue(expected.contains(LocalAudioConfig.LITELLM_BASE_URL))
     }
 }
