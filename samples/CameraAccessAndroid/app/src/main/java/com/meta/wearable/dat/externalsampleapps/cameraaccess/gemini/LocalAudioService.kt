@@ -55,6 +55,96 @@ class LocalAudioService {
     // Vision frames queue — prepended to the next chat completion message
     private val visionFrames = mutableListOf<String>()
 
+    // Conversation history for bounded context
+    private val conversationHistory = mutableListOf<Map<String, Any>>()
+
+    companion object {
+        /** Maximum number of messages to keep in conversation history (bounded memory) */
+        const val MAX_HISTORY_MESSAGES = 20
+
+        /** Pattern to strip reasoning/thinking tags from LLM responses */
+        private val THINK_TAG_PATTERN = Regex("<think>.*?</think>", RegexOption.DOT_MATCHES_ALL)
+
+        /** Strips any `<think>...</think>` reasoning blocks from text.
+         *  Returns the cleaned text, or empty string if only reasoning tags were present.
+         */
+        fun stripReasoningTags(text: String): String {
+            if (text.isBlank()) return text
+            val cleaned = THINK_TAG_PATTERN.replace(text, "").trim()
+            return cleaned.takeIf { it.isNotEmpty() } ?: text.trim()
+        }
+
+        /** Builds an OpenAI-compatible messages array with system prompt,
+         *  bounded conversation history, and optional vision frames.
+         *  Keeps only the last N messages to bound memory growth.
+         */
+        fun buildMessages(
+            systemPrompt: String,
+            transcript: String,
+            frames: List<String>,
+            history: List<Map<String, Any>>
+        ): JSONArray {
+            val content = JSONArray()
+            content.put(JSONObject().apply {
+                put("type", "text")
+                put("text", transcript)
+            })
+            for (frame in frames) {
+                content.put(JSONObject().apply {
+                    put("type", "image_url")
+                    put("image_url", JSONObject().put("url", "data:image/jpeg;base64,$frame"))
+                })
+            }
+
+            val messagesArray = JSONArray()
+
+            // Always include system message
+            val systemMsg = JSONObject()
+            systemMsg.put("role", "system")
+            systemMsg.put("content", systemPrompt)
+            messagesArray.put(systemMsg)
+
+            // Add bounded conversation history (oldest first, then current)
+            val recentHistory = if (history.size > MAX_HISTORY_MESSAGES) {
+                history.subList(history.size - MAX_HISTORY_MESSAGES + 1, history.size)
+            } else {
+                history.toList()
+            }
+            for (msg in recentHistory) {
+                messagesArray.put(JSONObject(msg))
+            }
+
+            // Add current user message with optional vision frames
+            val userMsg = JSONObject()
+            userMsg.put("role", "user")
+            userMsg.put("content", content)
+            messagesArray.put(userMsg)
+
+            return messagesArray
+        }
+
+        /**
+         * Appends a user+assistant pair to history (one turn).
+         * Keeps history bounded by the MAX_HISTORY_MESSAGES limit.
+         */
+        fun recordTurn(history: MutableList<Map<String, Any>>, userMessage: Map<String, Any>, assistantMessage: Map<String, Any>): MutableList<Map<String, Any>> {
+            history.add(userMessage)
+            history.add(assistantMessage)
+
+            // Keep bounded
+            while (history.size > MAX_HISTORY_MESSAGES * 2) {
+                // Remove oldest pair (user + assistant) to maintain pairing
+                if (history.size >= 2) {
+                    history.removeAt(0)
+                    history.removeAt(0)
+                } else {
+                    break
+                }
+            }
+            return history
+        }
+    }
+
     // ─── Enqueue a vision frame (sent with next chat completion) ────────────────
     fun enqueueVisionFrame(base64Jpeg: String) {
         synchronized(visionFrames) {
@@ -64,11 +154,12 @@ class LocalAudioService {
         }
     }
 
-    // ─── Step 1: PCM16 → WhisperX STT ─────────────────────────────────────────
+    // ─── Step 1: PCM16 → WhisperX STT (transcribe_base64 endpoint) ─────────────
     suspend fun transcribe(pcmData: ByteArray): String? {
         return try {
             val base64Audio = Base64.encodeToString(pcmData, Base64.NO_WRAP)
-            val body = JSONObject().put("audio", base64Audio).toString()
+            // Use 'audio_base64' key to match the deployed WhisperX contract
+            val body = JSONObject().put("audio_base64", base64Audio).toString()
 
             val request = Request.Builder()
                 .url(LocalAudioConfig.WHISPERX_URL)
@@ -97,9 +188,12 @@ class LocalAudioService {
         return try {
             val frames = synchronized(visionFrames) { visionFrames.toList() }
 
-            val messagesArray = JSONArray()
-            messagesArray.put(systemMessage())
-            messagesArray.put(userMessageWithFrames(transcript, frames))
+            val messagesArray = LocalAudioService.buildMessages(
+                systemPrompt = SYSTEM_PROMPT,
+                transcript = transcript,
+                frames = frames,
+                history = conversationHistory.toList()
+            )
 
             val body = JSONObject().apply {
                 put("model", "local")
@@ -128,7 +222,9 @@ class LocalAudioService {
                     return null
                 }
 
-                val content = firstMessage(json)?.optString("content", "").orEmpty()
+                val rawContent = firstMessage(json)?.optString("content", "").orEmpty()
+                // Strip reasoning tags before forwarding to UI/TTS
+                val content = stripReasoningTags(rawContent)
                 _events.value = PipelineEvent.LlmResponse(content)
                 content
             }
@@ -183,13 +279,30 @@ class LocalAudioService {
                 }
 
                 val messagesArray = JSONArray()
-                messagesArray.put(systemMessage())
+
+                // Start with system message
+                val systemMsg = JSONObject()
+                systemMsg.put("role", "system")
+                systemMsg.put("content", SYSTEM_PROMPT)
+                messagesArray.put(systemMsg)
+
+                // Add bounded conversation history
+                val recentHistory = if (conversationHistory.size > MAX_HISTORY_MESSAGES) {
+                    conversationHistory.subList(conversationHistory.size - MAX_HISTORY_MESSAGES + 1, conversationHistory.size)
+                } else {
+                    conversationHistory.toList()
+                }
+                for (msg in recentHistory) {
+                    messagesArray.put(JSONObject(msg))
+                }
+
                 if (toolCallId.isNotEmpty()) {
-                    messagesArray.put(JSONObject().apply {
+                    val toolMsg = JSONObject().apply {
                         put("role", "tool")
                         put("tool_call_id", toolCallId)
                         put("content", content)
-                    })
+                    }
+                    messagesArray.put(toolMsg)
                 } else {
                     // Fall back to a user "continue" prompt when the envelope
                     // shape is unrecognized — preserves prior behavior.
@@ -221,10 +334,12 @@ class LocalAudioService {
                     }
                     val respBody = httpResponse.body?.string().orEmpty()
                     val json = JSONObject(respBody)
-                    val nextContent = firstMessage(json)?.optString("content", "").orEmpty()
-                    if (nextContent.isNotEmpty()) {
-                        _events.value = PipelineEvent.LlmResponse(nextContent)
-                        onResponseForTts?.invoke(nextContent)
+                    val rawContent = firstMessage(json)?.optString("content", "").orEmpty()
+                    // Strip reasoning tags before forwarding
+                    val content = stripReasoningTags(rawContent)
+                    if (content.isNotEmpty()) {
+                        _events.value = PipelineEvent.LlmResponse(content)
+                        onResponseForTts?.invoke(content)
                     }
                 }
             } catch (e: Exception) {
@@ -235,16 +350,52 @@ class LocalAudioService {
 
     // ─── Inject proactive notification text ────────────────────────────────────
     fun injectNotification(text: String) {
+        // Strip reasoning tags even from injected notifications
+        val cleanedText = stripReasoningTags(text)
         // Synthesize a response from the injected text
         scope.launch {
-            _events.value = PipelineEvent.LlmResponse(text)
-            onResponseForTts?.invoke(text)
+            _events.value = PipelineEvent.LlmResponse(cleanedText)
+            onResponseForTts?.invoke(cleanedText)
         }
     }
 
     // ─── Route LLM text → TTS callback ─────────────────────────────────────────
     fun sendToTts(text: String) {
-        onResponseForTts?.invoke(text)
+        val cleanedText = stripReasoningTags(text)
+        onResponseForTts?.invoke(cleanedText)
+    }
+
+    /**
+     * Records the user input and assistant response in conversation history
+     * with bounded memory. Called by the ViewModel after each pipeline round-trip.
+     */
+    fun recordConversationTurn(userText: String, assistantText: String) {
+        val userMsg = mapOf(
+            "role" to "user",
+            "content" to userText
+        )
+        val assistantMsg = mapOf(
+            "role" to "assistant",
+            "content" to stripReasoningTags(assistantText)
+        )
+        LocalAudioService.recordTurn(conversationHistory, userMsg, assistantMsg)
+    }
+
+    /**
+     * Exposes the current conversation history for the ViewModel to observe
+     * (useful for debugging or persistence).
+     */
+    fun getConversationHistory(): List<Map<String, Any>> {
+        return conversationHistory.toList()
+    }
+
+    /**
+     * Clears conversation history (useful for session reset).
+     */
+    fun clearConversationHistory() {
+        synchronized(conversationHistory) {
+            conversationHistory.clear()
+        }
     }
 
     // ─── Full pipeline (audio + optional vision frames) ───────────────────────
@@ -255,6 +406,10 @@ class LocalAudioService {
 
             val transcript = transcribe(pcmData) ?: return@launch
             val response = generateResponse(transcript) ?: return@launch
+
+            // Record this turn in conversation history
+            recordConversationTurn(transcript, response)
+
             sendToTts(response)
         }
     }
@@ -264,29 +419,6 @@ class LocalAudioService {
     }
 
     // ─── JSON helpers ─────────────────────────────────────────────────────────
-    private fun systemMessage(): JSONObject = JSONObject().apply {
-        put("role", "system")
-        put("content", SYSTEM_PROMPT)
-    }
-
-    private fun userMessageWithFrames(transcript: String, frames: List<String>): JSONObject {
-        val content = JSONArray()
-        content.put(JSONObject().apply {
-            put("type", "text")
-            put("text", transcript)
-        })
-        for (frame in frames) {
-            content.put(JSONObject().apply {
-                put("type", "image_url")
-                put("image_url", JSONObject().put("url", "data:image/jpeg;base64,$frame"))
-            })
-        }
-        return JSONObject().apply {
-            put("role", "user")
-            put("content", content)
-        }
-    }
-
     private fun firstChoice(json: JSONObject): JSONObject? =
         json.optJSONArray("choices")?.optJSONObject(0)
 

@@ -1,0 +1,11 @@
+# Local development properties for VisionClaw
+# Copy this file to local.properties and adjust values as needed
+# This file is .gitignore'd - do NOT commit actual secrets
+
+# GitHub token for Meta DAT Android SDK (required for build)
+# Get token from https://github.com/settings/tokens
+github_token=YOUR_GITHUB_TOKEN_HERE
+
+# LiteLLM endpoint (overrides buildConfigField for local dev)
+LITELLM_BASE_URL=http://100.105.130.81:4000/v1
+WHISPERX_URL=http://100.105.130.81:5000/transcribe_base64

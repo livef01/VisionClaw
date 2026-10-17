@@ -54,10 +54,19 @@ jobs:
           # values that let the build compile without real API keys.
           cp app/src/main/java/com/meta/wearable/dat/externalsampleapps/cameraaccess/Secrets.kt.example \
              app/src/main/java/com/meta/wearable/dat/externalsampleapps/cameraaccess/Secrets.kt
+          echo "LITELLM_BASE_URL=${LITELLM_BASE_URL}" >> local.properties
+          echo "WHISPERX_URL=${WHISPERX_URL}" >> local.properties
 
       - name: Build Debug APK
         working-directory: samples/CameraAccessAndroid
-        run: ./gradlew assembleDebug --no-daemon
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LITELLM_BASE_URL: $LITELLM_BASE_URL
+          WHISPERX_URL: $WHISPERX_URL
+        run: |
+          ./gradlew assembleDebug --no-daemon \
+            -PLITELLM_BASE_URL="$LITELLM_BASE_URL" \
+            -PWHISPERX_URL="$WHISPERX_URL"
 
       - name: Upload Debug APK
         uses: actions/upload-artifact@v4

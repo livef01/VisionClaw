@@ -27,6 +27,13 @@ android {
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     vectorDrawables { useSupportLibrary = true }
+
+    // Inject endpoints via BuildConfig so they can be overridden per variant
+    // without touching source code.  CI sets these via env vars.
+    buildConfigField("String", "LITELLM_BASE_URL",
+        "\"${project.findProperty("LITELLM_BASE_URL") ?: "http://100.105.130.81:4000/v1"}\"")
+    buildConfigField("String", "WHISPERX_URL",
+        "\"${project.findProperty("WHISPERX_URL") ?: "http://100.105.130.81:5000/transcribe_base64"}\"")
   }
 
   buildTypes {
@@ -76,7 +83,11 @@ dependencies {
   implementation(libs.datastore.preferences)
   implementation(libs.gson)
   implementation(libs.lifecycle.process)
-  androidTestImplementation(libs.androidx.ui.test.junit4)
-  androidTestImplementation(libs.androidx.test.uiautomator)
-  androidTestImplementation(libs.androidx.test.rules)
+androidTestImplementation(libs.androidx.ui.test.junit4)
+androidTestImplementation(libs.androidx.test.uiautomator)
+androidTestImplementation(libs.androidx.test.rules)
+
+// Unit tests
+testImplementation("junit:junit:4.13.2")
+testImplementation("org.json:json:20230618")
 }

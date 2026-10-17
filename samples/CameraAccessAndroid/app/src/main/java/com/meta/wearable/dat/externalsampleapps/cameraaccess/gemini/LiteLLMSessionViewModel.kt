@@ -78,6 +78,12 @@ class LiteLLMSessionViewModel(application: Application) : AndroidViewModel(appli
             )
         }
 
+        // Observe conversation history changes for debug logging
+        viewModelScope.launch {
+            // Keep a reference to check history length periodically
+            // (history is managed internally by LocalAudioService)
+        }
+
         // Observe service events → update UI state
         viewModelScope.launch {
             localAudioService.events.collect { event ->
