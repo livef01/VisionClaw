@@ -31,25 +31,25 @@ class LocalAudioServiceUnitTest {
 
     @Test
     fun stripReasoningTags_singleThinkBlock() {
-        val input = "</think>Let me think about this.</think> Hello there!"
+        val input = "<think>Let me think about this.</think> Hello there!"
         assertEquals("Hello there!", LocalAudioService.stripReasoningTags(input))
     }
 
     @Test
     fun stripReasoningTags_onlyThinkBlock() {
-        val input = "</think>Some reasoning here.</think> "
+        val input = "<think>Some reasoning here.</think> "
         assertEquals("", LocalAudioService.stripReasoningTags(input))
     }
 
     @Test
     fun stripReasoningTags_multipleThinkBlocks() {
-        val input = "</think>First thought.</think> middle </think>Second thought.</think> end"
+        val input = "<think>First thought.</think> middle <think>Second thought.</think> end"
         assertEquals("middle  end", LocalAudioService.stripReasoningTags(input))
     }
 
     @Test
     fun stripReasoningTags_thinkBlockAtStart() {
-        val input = "</think>reasoning</think> actual response"
+        val input = "<think>reasoning</think> actual response"
         assertEquals("actual response", LocalAudioService.stripReasoningTags(input))
     }
 
@@ -61,7 +61,7 @@ class LocalAudioServiceUnitTest {
 
     @Test
     fun stripReasoningTags_multilineThinkBlock() {
-        val input = "</think>" +
+        val input = "<think>" +
             "Line 1\n" +
             "Line 2\n" +
             "</think> Hello!"
@@ -273,8 +273,16 @@ class LocalAudioServiceUnitTest {
 
         LocalAudioService.recordToolTurn(
             history,
-            assistantToolCallContent = "<think>thinking</think> Let me call a tool",
-            toolResults = listOf(mapOf("role" to "tool", "tool_call_id" to "call1", "content" to "result")),
+            assistantToolCallMessage = mapOf(
+                "role" to "assistant",
+                "content" to "<think>thinking</think> Let me call a tool",
+                "tool_calls" to listOf(mapOf("id" to "call1"))
+            ),
+            toolResults = listOf(mapOf(
+                "role" to "tool",
+                "tool_call_id" to "call1",
+                "content" to "<think>private result</think>result"
+            )),
             assistantFinalContent = "Done with tool result"
         )
 
@@ -287,6 +295,8 @@ class LocalAudioServiceUnitTest {
         val content = history[0]["content"] as String
         assertFalse(content.contains("thinking"))
         assertEquals("Let me call a tool", content.trim())
+        assertEquals("result", history[1]["content"])
+        assertTrue(history[0].containsKey("tool_calls"))
     }
 
     @Test
@@ -297,7 +307,11 @@ class LocalAudioServiceUnitTest {
         for (i in 1..30) {
             LocalAudioService.recordToolTurn(
                 history,
-                assistantToolCallContent = "assistant $i",
+                assistantToolCallMessage = mapOf(
+                    "role" to "assistant",
+                    "content" to "assistant $i",
+                    "tool_calls" to listOf(mapOf("id" to "call$i"))
+                ),
                 toolResults = listOf(mapOf("role" to "tool", "content" to "tool $i")),
                 assistantFinalContent = "final $i"
             )
@@ -312,7 +326,7 @@ class LocalAudioServiceUnitTest {
     fun fullPipeline_stripsReasoningBeforeRecording() {
         val history = mutableListOf<Map<String, Any>>()
 
-        val assistantRaw = "</think>Let me think about this.</think> Hello there!"
+        val assistantRaw = "<think>Let me think about this.</think> Hello there!"
         val assistantClean = LocalAudioService.stripReasoningTags(assistantRaw)
 
         val userMsg = mapOf("role" to "user", "content" to "What's the weather?")

@@ -57,6 +57,10 @@ class LocalAudioService {
 
     // Conversation history for bounded context
     private val conversationHistory = mutableListOf<Map<String, Any>>()
+    private var pendingUserMessage: Map<String, Any>? = null
+    private var pendingToolCallMessage: Map<String, Any>? = null
+    private val pendingToolResults = mutableListOf<Map<String, Any>>()
+    private val pendingToolCallIds = mutableSetOf<String>()
 
     companion object {
         private val JSON = "application/json; charset=utf-8".toMediaType()
@@ -74,7 +78,7 @@ class LocalAudioService {
         /** Pattern to strip reasoning/thinking tags from LLM responses.
          *  Removes any [thinking]...[/thinking] blocks.
          */
-        private val THINK_TAG_PATTERN = Regex("</think>.*?</think>", RegexOption.DOT_MATCHES_ALL)
+        private val THINK_TAG_PATTERN = Regex("<think>.*?</think>", RegexOption.DOT_MATCHES_ALL)
 
         /** Strips reasoning/thinking tags from text.
          *  Returns the cleaned text with all thinking blocks removed.
@@ -165,23 +169,29 @@ class LocalAudioService {
          * 3. The assistant's response after processing the tool results
          * All entries are stripped of reasoning tags before recording.
          */
-        fun recordToolTurn(history: MutableList<Map<String, Any>>, 
-                            assistantToolCallContent: String,
-                            toolResults: List<Map<String, Any>>,
-                            assistantFinalContent: String): MutableList<Map<String, Any>> {
+        fun recordToolTurn(
+            history: MutableList<Map<String, Any>>,
+            assistantToolCallMessage: Map<String, Any>,
+            toolResults: List<Map<String, Any>>,
+            assistantFinalContent: String
+        ): MutableList<Map<String, Any>> {
             // Add the assistant's tool-call message
-            val toolCallMsg = mapOf(
-                "role" to "assistant",
-                "content" to stripReasoningTags(assistantToolCallContent)
-            )
+            val toolCallMsg = assistantToolCallMessage.toMutableMap()
+            val assistantContent = toolCallMsg["content"]
+            if (assistantContent is String) {
+                toolCallMsg["content"] = stripReasoningTags(assistantContent)
+            }
             history.add(toolCallMsg)
 
-            // Add each tool result
+            // Add each tool result, stripping reasoning tags from content
             for (toolResult in toolResults) {
-                history.add(toolResult)
+                val resultCopy = toolResult.toMutableMap()
+                val resultContent = resultCopy["content"]
+                if (resultContent is String) {
+                    resultCopy["content"] = stripReasoningTags(resultContent)
+                }
+                history.add(resultCopy)
             }
-
-            // Add the assistant's final response after tool processing
             val finalMsg = mapOf(
                 "role" to "assistant",
                 "content" to stripReasoningTags(assistantFinalContent)
@@ -250,6 +260,7 @@ class LocalAudioService {
                 frames = frames,
                 history = conversationHistory.toList()
             )
+            pendingUserMessage = mapOf("role" to "user", "content" to transcript)
 
             val body = JSONObject().apply {
                 put("model", "local")
@@ -271,16 +282,43 @@ class LocalAudioService {
                 val respBody = response.body?.string().orEmpty()
                 val json = JSONObject(respBody)
 
-                // Check for tool call in response
-                val toolCalls = firstChoice(json)?.optJSONArray("tool_calls")
+                // Check for tool calls in both API styles:
+                //   OpenAI: choices[0].message.tool_calls
+                //   Some APIs: choices[0].tool_calls
+                val message = firstMessage(json)
+                val toolCalls = message?.optJSONArray("tool_calls")
+                    ?: firstChoice(json)?.optJSONArray("tool_calls")
                 if (toolCalls != null && toolCalls.length() > 0) {
                     handleToolCalls(toolCalls)
+                    pendingToolCallMessage?.let {
+                        // A previous turn did not receive a final answer. Do
+                        // not overwrite its pending tool context.
+                        return null
+                    }
+                    pendingToolCallMessage = message?.let { jsonObjectToMap(it) } ?: mapOf(
+                        "role" to "assistant",
+                        "content" to "",
+                        "tool_calls" to toolCalls
+                    )
+                    pendingToolResults.clear()
+                    pendingToolCallIds.clear()
+                    for (i in 0 until toolCalls.length()) {
+                        toolCalls.optJSONObject(i)?.optString("id")?.takeIf { it.isNotEmpty() }
+                            ?.let { pendingToolCallIds.add(it) }
+                    }
                     return null
                 }
 
                 val rawContent = firstMessage(json)?.optString("content", "").orEmpty()
                 // Strip reasoning tags before forwarding to UI/TTS
                 val content = stripReasoningTags(rawContent)
+                pendingUserMessage?.let { userMessage ->
+                    recordConversationTurn(
+                        userMessage["content"]?.toString().orEmpty(),
+                        content
+                    )
+                    pendingUserMessage = null
+                }
                 _events.value = PipelineEvent.LlmResponse(content)
                 content
             }
@@ -334,6 +372,26 @@ class LocalAudioService {
                     else -> resultObj.toString()
                 }
 
+                val cleanedToolContent = stripReasoningTags(content)
+                if (toolCallId.isNotEmpty() && pendingToolResults.none {
+                        it["tool_call_id"] == toolCallId
+                    }) {
+                    pendingToolResults.add(mapOf(
+                        "role" to "tool",
+                        "tool_call_id" to toolCallId,
+                        "content" to cleanedToolContent
+                    ))
+                }
+
+                // LiteLLM requires the assistant tool-call message before its
+                // corresponding tool results. Wait for every result when the
+                // response contained multiple tool calls.
+                if (pendingToolCallIds.isNotEmpty() &&
+                    !pendingToolResults.mapNotNull { it["tool_call_id"] as? String }
+                        .containsAll(pendingToolCallIds)) {
+                    return@launch
+                }
+
                 val messagesArray = JSONArray()
 
                 // Start with system message
@@ -352,14 +410,17 @@ class LocalAudioService {
                     messagesArray.put(JSONObject(msg))
                 }
 
-                if (toolCallId.isNotEmpty()) {
-                    val toolMsg = JSONObject().apply {
-                        put("role", "tool")
-                        put("tool_call_id", toolCallId)
-                        put("content", content)
+                pendingUserMessage?.let { userMessage ->
+                    messagesArray.put(JSONObject(userMessage))
+                }
+                pendingToolCallMessage?.let { assistantToolCallMessage ->
+                    messagesArray.put(JSONObject(assistantToolCallMessage))
+                }
+                if (pendingToolResults.isNotEmpty()) {
+                    pendingToolResults.forEach { toolResult ->
+                        messagesArray.put(JSONObject(toolResult))
                     }
-                    messagesArray.put(toolMsg)
-                } else {
+                } else if (toolCallId.isEmpty()) {
                     // Fall back to a user "continue" prompt when the envelope
                     // shape is unrecognized — preserves prior behavior.
                     messagesArray.put(JSONObject().apply {
@@ -393,6 +454,20 @@ class LocalAudioService {
                     val rawContent = firstMessage(json)?.optString("content", "").orEmpty()
                     // Strip reasoning tags before forwarding
                     val content = stripReasoningTags(rawContent)
+                    pendingToolCallMessage?.let { assistantToolCallMessage ->
+                        pendingUserMessage?.let { userMessage ->
+                            conversationHistory.add(userMessage)
+                            pendingUserMessage = null
+                        }
+                        recordToolCallTurn(
+                            assistantToolCallMessage,
+                            pendingToolResults.toList(),
+                            content
+                        )
+                        pendingToolCallMessage = null
+                        pendingToolResults.clear()
+                        pendingToolCallIds.clear()
+                    }
                     if (content.isNotEmpty()) {
                         _events.value = PipelineEvent.LlmResponse(content)
                         onResponseForTts?.invoke(content)
@@ -410,10 +485,14 @@ class LocalAudioService {
      * - Each tool result message
      * - The assistant's final response after tool processing
      */
-    fun recordToolCallTurn(toolCallContent: String, toolResults: List<Map<String, Any>>, assistantFinalContent: String) {
+    fun recordToolCallTurn(
+        assistantToolCallMessage: Map<String, Any>,
+        toolResults: List<Map<String, Any>>,
+        assistantFinalContent: String
+    ) {
         LocalAudioService.recordToolTurn(
             conversationHistory,
-            assistantToolCallContent = toolCallContent,
+            assistantToolCallMessage = assistantToolCallMessage,
             toolResults = toolResults,
             assistantFinalContent = assistantFinalContent
         )
@@ -467,6 +546,10 @@ class LocalAudioService {
         synchronized(conversationHistory) {
             conversationHistory.clear()
         }
+        pendingUserMessage = null
+        pendingToolCallMessage = null
+        pendingToolResults.clear()
+        pendingToolCallIds.clear()
     }
 
     // ─── Full pipeline (audio + optional vision frames) ───────────────────────
@@ -477,9 +560,6 @@ class LocalAudioService {
 
             val transcript = transcribe(pcmData) ?: return@launch
             val response = generateResponse(transcript) ?: return@launch
-
-            // Record this turn in conversation history
-            recordConversationTurn(transcript, response)
 
             sendToTts(response)
         }
@@ -495,6 +575,19 @@ class LocalAudioService {
 
     private fun firstMessage(json: JSONObject): JSONObject? =
         firstChoice(json)?.optJSONObject("message")
+
+    private fun jsonObjectToMap(json: JSONObject): Map<String, Any> {
+        val result = mutableMapOf<String, Any>()
+        val keys = json.keys()
+        while (keys.hasNext()) {
+            val key = keys.next()
+            val value = json.opt(key)
+            if (value != null && value !== JSONObject.NULL) {
+                result[key] = value
+            }
+        }
+        return result
+    }
 }
 
 /** Lightweight payload for one tool call (id + name + JSON-encoded args). */

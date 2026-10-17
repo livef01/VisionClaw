@@ -55,7 +55,7 @@ jobs:
           # Secrets.kt is gitignored; the example file has safe placeholder
           # values that let the build compile without real API keys.
           cp app/src/main/java/com/meta/wearable/dat/externalsampleapps/cameraaccess/Secrets.kt.example \
-             app/src/main/java/com/meta.wearable/dat/externalsampleapps.cameraaccess/Secrets.kt
+             app/src/main/java/com/meta/wearable/dat/externalsampleapps/cameraaccess/Secrets.kt
           # Store endpoint URLs for local.properties (used by BuildConfig resolution)
           if [ -n "$LITELLM_BASE_URL" ]; then
             echo "LITELLM_BASE_URL=${LITELLM_BASE_URL}" >> local.properties
