@@ -47,26 +47,32 @@ jobs:
         working-directory: samples/CameraAccessAndroid
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LITELLM_BASE_URL: ${{ secrets.LITELLM_BASE_URL }}
+          WHISPERX_URL: ${{ secrets.WHISPERX_URL }}
         run: |
           # github_token is read by settings.gradle.kts to auth GitHub Packages
           echo "github_token=${GITHUB_TOKEN}" >> local.properties
           # Secrets.kt is gitignored; the example file has safe placeholder
           # values that let the build compile without real API keys.
           cp app/src/main/java/com/meta/wearable/dat/externalsampleapps/cameraaccess/Secrets.kt.example \
-             app/src/main/java/com/meta/wearable/dat/externalsampleapps/cameraaccess/Secrets.kt
-          echo "LITELLM_BASE_URL=${LITELLM_BASE_URL}" >> local.properties
-          echo "WHISPERX_URL=${WHISPERX_URL}" >> local.properties
+             app/src/main/java/com/meta.wearable/dat/externalsampleapps.cameraaccess/Secrets.kt
+          # Store endpoint URLs for local.properties (used by BuildConfig resolution)
+          if [ -n "$LITELLM_BASE_URL" ]; then
+            echo "LITELLM_BASE_URL=${LITELLM_BASE_URL}" >> local.properties
+          fi
+          if [ -n "$WHISPERX_URL" ]; then
+            echo "WHISPERX_URL=${WHISPERX_URL}" >> local.properties
+          fi
+
+      - name: Run unit tests
+        working-directory: samples/CameraAccessAndroid
+        run: ./gradlew :app:testDebugUnitTest --no-daemon
 
       - name: Build Debug APK
         working-directory: samples/CameraAccessAndroid
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          LITELLM_BASE_URL: $LITELLM_BASE_URL
-          WHISPERX_URL: $WHISPERX_URL
-        run: |
-          ./gradlew assembleDebug --no-daemon \
-            -PLITELLM_BASE_URL="$LITELLM_BASE_URL" \
-            -PWHISPERX_URL="$WHISPERX_URL"
+        run: ./gradlew assembleDebug --no-daemon
 
       - name: Upload Debug APK
         uses: actions/upload-artifact@v4
@@ -74,3 +80,10 @@ jobs:
           name: visionclaw-debug-apk
           path: samples/CameraAccessAndroid/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
+
+      - name: Upload test reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: unit-test-reports
+          path: samples/CameraAccessAndroid/app/build/reports/tests/testDebugUnitTest/

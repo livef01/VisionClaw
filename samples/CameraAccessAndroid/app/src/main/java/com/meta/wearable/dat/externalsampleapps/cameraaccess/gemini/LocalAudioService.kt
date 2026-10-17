@@ -59,24 +59,37 @@ class LocalAudioService {
     private val conversationHistory = mutableListOf<Map<String, Any>>()
 
     companion object {
-        /** Maximum number of messages to keep in conversation history (bounded memory) */
+        private val JSON = "application/json; charset=utf-8".toMediaType()
+        private val SYSTEM_PROMPT = """
+            You are a helpful voice assistant wearing smart glasses. Keep responses concise and conversational.
+            The user is speaking to you via voice. Respond in a natural, brief way.
+            You have access to tools for controlling smart home devices, querying information, and more.
+        """.trimIndent()
+
+        /** Maximum number of messages to keep in conversation history (bounded memory).
+         *  This is the total cap on messages sent to the LLM, including system and current turn.
+         */
         const val MAX_HISTORY_MESSAGES = 20
 
-        /** Pattern to strip reasoning/thinking tags from LLM responses */
-        private val THINK_TAG_PATTERN = Regex("<think>.*?</think>", RegexOption.DOT_MATCHES_ALL)
+        /** Pattern to strip reasoning/thinking tags from LLM responses.
+         *  Removes any [thinking]...[/thinking] blocks.
+         */
+        private val THINK_TAG_PATTERN = Regex("</think>.*?</think>", RegexOption.DOT_MATCHES_ALL)
 
-        /** Strips any `<think>...</think>` reasoning blocks from text.
-         *  Returns the cleaned text, or empty string if only reasoning tags were present.
+        /** Strips reasoning/thinking tags from text.
+         *  Returns the cleaned text with all thinking blocks removed.
+         *  Returns empty string if the result would otherwise be blank.
          */
         fun stripReasoningTags(text: String): String {
             if (text.isBlank()) return text
             val cleaned = THINK_TAG_PATTERN.replace(text, "").trim()
-            return cleaned.takeIf { it.isNotEmpty() } ?: text.trim()
+            return cleaned.ifEmpty { "" }
         }
 
         /** Builds an OpenAI-compatible messages array with system prompt,
          *  bounded conversation history, and optional vision frames.
-         *  Keeps only the last N messages to bound memory growth.
+         *  Keeps only the last MAX_HISTORY_MESSAGES messages to bound payload size.
+         *  The final message list always ends with the current user message.
          */
         fun buildMessages(
             systemPrompt: String,
@@ -104,9 +117,9 @@ class LocalAudioService {
             systemMsg.put("content", systemPrompt)
             messagesArray.put(systemMsg)
 
-            // Add bounded conversation history (oldest first, then current)
+            // Add bounded conversation history (last N messages)
             val recentHistory = if (history.size > MAX_HISTORY_MESSAGES) {
-                history.subList(history.size - MAX_HISTORY_MESSAGES + 1, history.size)
+                history.subList(history.size - MAX_HISTORY_MESSAGES, history.size)
             } else {
                 history.toList()
             }
@@ -125,20 +138,63 @@ class LocalAudioService {
 
         /**
          * Appends a user+assistant pair to history (one turn).
-         * Keeps history bounded by the MAX_HISTORY_MESSAGES limit.
+         * Keeps history bounded to MAX_HISTORY_MESSAGES total entries.
+         * Maintains user/assistant pairing by removing oldest pairs together.
          */
         fun recordTurn(history: MutableList<Map<String, Any>>, userMessage: Map<String, Any>, assistantMessage: Map<String, Any>): MutableList<Map<String, Any>> {
             history.add(userMessage)
             history.add(assistantMessage)
 
-            // Keep bounded
-            while (history.size > MAX_HISTORY_MESSAGES * 2) {
-                // Remove oldest pair (user + assistant) to maintain pairing
+            // Keep bounded to MAX_HISTORY_MESSAGES total entries
+            while (history.size > MAX_HISTORY_MESSAGES) {
+                // Remove oldest pair to preserve user/assistant pairing
                 if (history.size >= 2) {
                     history.removeAt(0)
                     history.removeAt(0)
                 } else {
-                    break
+                    history.removeAt(0)
+                }
+            }
+            return history
+        }
+
+        /**
+         * Records a tool-call interaction in conversation history:
+         * 1. The original assistant message that contained the tool calls
+         * 2. The tool result messages
+         * 3. The assistant's response after processing the tool results
+         * All entries are stripped of reasoning tags before recording.
+         */
+        fun recordToolTurn(history: MutableList<Map<String, Any>>, 
+                            assistantToolCallContent: String,
+                            toolResults: List<Map<String, Any>>,
+                            assistantFinalContent: String): MutableList<Map<String, Any>> {
+            // Add the assistant's tool-call message
+            val toolCallMsg = mapOf(
+                "role" to "assistant",
+                "content" to stripReasoningTags(assistantToolCallContent)
+            )
+            history.add(toolCallMsg)
+
+            // Add each tool result
+            for (toolResult in toolResults) {
+                history.add(toolResult)
+            }
+
+            // Add the assistant's final response after tool processing
+            val finalMsg = mapOf(
+                "role" to "assistant",
+                "content" to stripReasoningTags(assistantFinalContent)
+            )
+            history.add(finalMsg)
+
+            // Keep bounded
+            while (history.size > MAX_HISTORY_MESSAGES) {
+                if (history.size >= 2) {
+                    history.removeAt(0)
+                    history.removeAt(0)
+                } else {
+                    history.removeAt(0)
                 }
             }
             return history
@@ -288,7 +344,7 @@ class LocalAudioService {
 
                 // Add bounded conversation history
                 val recentHistory = if (conversationHistory.size > MAX_HISTORY_MESSAGES) {
-                    conversationHistory.subList(conversationHistory.size - MAX_HISTORY_MESSAGES + 1, conversationHistory.size)
+                    conversationHistory.subList(conversationHistory.size - MAX_HISTORY_MESSAGES, conversationHistory.size)
                 } else {
                     conversationHistory.toList()
                 }
@@ -346,6 +402,21 @@ class LocalAudioService {
                 _events.value = PipelineEvent.Error("Tool response error: ${e.message}")
             }
         }
+    }
+
+    /**
+     * Records a tool-call conversation turn in history:
+     * - The original assistant message that contained tool calls
+     * - Each tool result message
+     * - The assistant's final response after tool processing
+     */
+    fun recordToolCallTurn(toolCallContent: String, toolResults: List<Map<String, Any>>, assistantFinalContent: String) {
+        LocalAudioService.recordToolTurn(
+            conversationHistory,
+            assistantToolCallContent = toolCallContent,
+            toolResults = toolResults,
+            assistantFinalContent = assistantFinalContent
+        )
     }
 
     // ─── Inject proactive notification text ────────────────────────────────────
@@ -424,15 +495,6 @@ class LocalAudioService {
 
     private fun firstMessage(json: JSONObject): JSONObject? =
         firstChoice(json)?.optJSONObject("message")
-
-    companion object {
-        private val JSON = "application/json; charset=utf-8".toMediaType()
-        private val SYSTEM_PROMPT = """
-            You are a helpful voice assistant wearing smart glasses. Keep responses concise and conversational.
-            The user is speaking to you via voice. Respond in a natural, brief way.
-            You have access to tools for controlling smart home devices, querying information, and more.
-        """.trimIndent()
-    }
 }
 
 /** Lightweight payload for one tool call (id + name + JSON-encoded args). */

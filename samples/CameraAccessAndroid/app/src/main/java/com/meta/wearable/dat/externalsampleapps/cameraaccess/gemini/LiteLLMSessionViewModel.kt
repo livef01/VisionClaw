@@ -219,7 +219,9 @@ class LiteLLMSessionViewModel(application: Application) : AndroidViewModel(appli
      * Sends the latest vision frame along with the next audio chunk.
      */
     fun sendVideoFrameIfThrottled(bitmap: Bitmap) {
-        if (!LocalAudioConfig.WHISPERX_URL.contains("localhost") && !LocalAudioConfig.WHISPERX_URL.contains("10.10")) return
+        // Vision frames are sent whenever the session is active and ready.
+        // No host-based allowlist — the endpoint is configured in LocalAudioConfig
+        // and applies uniformly regardless of which server hosts WhisperX.
         if (!sessionActive) return
         if (_uiState.value.connectionState != LiteLlmConnectionState.Ready) return
 

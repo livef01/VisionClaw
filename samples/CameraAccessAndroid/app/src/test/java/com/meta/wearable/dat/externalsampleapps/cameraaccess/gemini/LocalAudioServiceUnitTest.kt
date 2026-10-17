@@ -31,37 +31,37 @@ class LocalAudioServiceUnitTest {
 
     @Test
     fun stripReasoningTags_singleThinkBlock() {
-        val input = "<think>Let me think about this.</think> Hello there!"
+        val input = "</think>Let me think about this.</think> Hello there!"
         assertEquals("Hello there!", LocalAudioService.stripReasoningTags(input))
     }
 
     @Test
     fun stripReasoningTags_onlyThinkBlock() {
-        val input = "<think>Some reasoning here.</think> "
+        val input = "</think>Some reasoning here.</think> "
         assertEquals("", LocalAudioService.stripReasoningTags(input))
     }
 
     @Test
     fun stripReasoningTags_multipleThinkBlocks() {
-        val input = "<think>First thought.</think> middle <think>Second thought.</think> end"
+        val input = "</think>First thought.</think> middle </think>Second thought.</think> end"
         assertEquals("middle  end", LocalAudioService.stripReasoningTags(input))
     }
 
     @Test
     fun stripReasoningTags_thinkBlockAtStart() {
-        val input = "<think>reasoning</think> actual response"
+        val input = "</think>reasoning</think> actual response"
         assertEquals("actual response", LocalAudioService.stripReasoningTags(input))
     }
 
     @Test
     fun stripReasoningTags_thinkBlockAtEnd() {
-        val input = "real answer <think>extra reasoning</think>"
-        assertEquals("real answer  ", LocalAudioService.stripReasoningTags(input).trim())
+        val input = "real answer  <think>extra reasoning</think>"
+        assertEquals("real answer", LocalAudioService.stripReasoningTags(input))
     }
 
     @Test
     fun stripReasoningTags_multilineThinkBlock() {
-        val input = "<think>" +
+        val input = "</think>" +
             "Line 1\n" +
             "Line 2\n" +
             "</think> Hello!"
@@ -154,6 +154,27 @@ class LocalAudioServiceUnitTest {
         assertTrue(messages.length() <= 22)
     }
 
+    @Test
+    fun buildMessages_respectsMaxBound() {
+        val history = mutableListOf<Map<String, Any>>()
+        for (i in 1..50) {
+            history.add(mapOf("role" to if (i % 2 == 1) "user" else "assistant", "content" to "msg$i"))
+        }
+
+        val messages = LocalAudioService.buildMessages(
+            systemPrompt = "Test",
+            transcript = "Current",
+            frames = emptyList(),
+            history = history.toList()
+        )
+
+        // Total messages capped: system(1) + MAX_HISTORY_MESSAGES(20) + user(1) = 22
+        assertTrue(messages.length() <= 1 + LocalAudioService.MAX_HISTORY_MESSAGES + 1)
+
+        // Last message should be the current user message
+        assertEquals("user", messages.getJSONObject(messages.length() - 1).getString("role"))
+    }
+
     // ─── recordTurn ──────────────────────────────────────────────────────────
 
     @Test
@@ -174,14 +195,14 @@ class LocalAudioServiceUnitTest {
     fun recordTurn_boundedHistory() {
         val history = mutableListOf<Map<String, Any>>()
 
-        // Fill up to MAX_HISTORY_MESSAGES * 2 entries
+        // Fill up to MAX_HISTORY_MESSAGES entries
         for (i in 1..50) {
             val userMsg = mapOf("role" to "user", "content" to "user$i")
             val assistantMsg = mapOf("role" to "assistant", "content" to "assistant$i")
             LocalAudioService.recordTurn(history, userMsg, assistantMsg)
         }
 
-        // Should be bounded to MAX_HISTORY_MESSAGES entries
+        // Should be bounded to MAX_HISTORY_MESSAGES total entries
         assertTrue(history.size <= LocalAudioService.MAX_HISTORY_MESSAGES)
     }
 
@@ -224,13 +245,74 @@ class LocalAudioServiceUnitTest {
         assertTrue(history.any { it["content"] == lastAssistantContent })
     }
 
+    @Test
+    fun recordTurn_maintains_pairing_when_capped_at_single_entry() {
+        val history = mutableListOf<Map<String, Any>>()
+
+        // Add entries until we're at exactly MAX_HISTORY_MESSAGES
+        for (i in 1..40) {
+            val userMsg = mapOf("role" to "user", "content" to "user$i")
+            val assistantMsg = mapOf("role" to "assistant", "content" to "assistant$i")
+            LocalAudioService.recordTurn(history, userMsg, assistantMsg)
+        }
+
+        // All remaining entries should be in pairs
+        for (i in history.indices step 2) {
+            assertEquals("user", history[i]["role"])
+            if (i + 1 < history.size) {
+                assertEquals("assistant", history[i + 1]["role"])
+            }
+        }
+    }
+
+    // ─── recordToolTurn ──────────────────────────────────────────────────────
+
+    @Test
+    fun recordToolTurn_records_all_phases() {
+        val history = mutableListOf<Map<String, Any>>()
+
+        LocalAudioService.recordToolTurn(
+            history,
+            assistantToolCallContent = "<think>thinking</think> Let me call a tool",
+            toolResults = listOf(mapOf("role" to "tool", "tool_call_id" to "call1", "content" to "result")),
+            assistantFinalContent = "Done with tool result"
+        )
+
+        assertEquals(3, history.size)
+        assertEquals("assistant", history[0]["role"])
+        assertEquals("tool", history[1]["role"])
+        assertEquals("assistant", history[2]["role"])
+
+        // Reasoning tags should be stripped
+        val content = history[0]["content"] as String
+        assertFalse(content.contains("thinking"))
+        assertEquals("Let me call a tool", content.trim())
+    }
+
+    @Test
+    fun recordToolTurn_bounded() {
+        val history = mutableListOf<Map<String, Any>>()
+
+        // Do enough tool turns to exceed the limit
+        for (i in 1..30) {
+            LocalAudioService.recordToolTurn(
+                history,
+                assistantToolCallContent = "assistant $i",
+                toolResults = listOf(mapOf("role" to "tool", "content" to "tool $i")),
+                assistantFinalContent = "final $i"
+            )
+        }
+
+        assertTrue(history.size <= LocalAudioService.MAX_HISTORY_MESSAGES)
+    }
+
     // ─── Integration: strip then record ───────────────────────────────────────
 
     @Test
     fun fullPipeline_stripsReasoningBeforeRecording() {
         val history = mutableListOf<Map<String, Any>>()
 
-        val assistantRaw = "<think>Let me think about this.</think> Hello there!"
+        val assistantRaw = "</think>Let me think about this.</think> Hello there!"
         val assistantClean = LocalAudioService.stripReasoningTags(assistantRaw)
 
         val userMsg = mapOf("role" to "user", "content" to "What's the weather?")
